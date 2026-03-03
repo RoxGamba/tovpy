@@ -36,12 +36,20 @@ class Utils:
 
     """
 
-    def __init__(self, eos, p, path=None):
+    def __init__(self, eos, p, path=None, ode_backend='scipy'):
         """
         Parameters
         ----------
+        eos : EOS
+            Equation of state instance.
+        p : array_like
+            Array of central pressures (geometric units).
         path : str, optional
             Path to the directory where data will be saved. If None, uses the current working directory.
+        ode_backend : str or ODESolver, optional
+            ODE solver backend forwarded to every :class:`~tovpy.tov.TOV` instance
+            created by this utility.  One of ``'scipy'`` (default), ``'numba'``,
+            ``'jax'``, or a pre-built :class:`~tovpy.solvers.ODESolver`.
         """
         self.path = path if path else os.getcwd()
         if not os.path.exists(self.path):
@@ -53,6 +61,7 @@ class Utils:
         if len(p) == 0:
             raise ValueError("Must provide a pressure array")
         self.p = np.array(p)
+        self.ode_backend = ode_backend
 
     def eos_plot(self, savefigon= False, filename=None):
         """
@@ -141,7 +150,8 @@ class Utils:
         this_tov = TOV(eos = self.eos, #ode_method='RK45',
                         ode_atol=1e-10, 
                         ode_rtol=1e-10, 
-                        dhfact=-1e-12)
+                        dhfact=-1e-12,
+                        ode_backend=self.ode_backend)
         m_list, r_list, c_list = np.zeros(len(self.p)), np.zeros(len(self.p)), np.zeros(len(self.p))
         for i, pc in enumerate(self.p):
             m, r, c = this_tov.solve(pc)[:3]
@@ -191,7 +201,8 @@ class Utils:
         this_tov = TOV(eos = self.eos, #ode_method='RK45',
                         ode_atol=1e-10, 
                         ode_rtol=1e-10, 
-                        dhfact=-1e-12)
+                        dhfact=-1e-12,
+                        ode_backend=self.ode_backend)
         m_list, r_list, c_list = np.zeros(len(self.p)), np.zeros(len(self.p)), np.zeros(len(self.p))
         for i, pc in enumerate(self.p):
             m, r, c = this_tov.solve(pc)[:3]
@@ -223,7 +234,8 @@ class Utils:
         this_tov = TOV(eos=self.eos, leven=leven, lodd=lodd,  # ode_method='RK45',
                     ode_atol=1e-10, 
                     ode_rtol=1e-10, 
-                    dhfact=-1e-12)
+                    dhfact=-1e-12,
+                    ode_backend=self.ode_backend)
         
         c_list = np.zeros(len(self.p))
         k_vars, h_vars = {}, {}
@@ -307,7 +319,8 @@ class Utils:
         this_tov = TOV(eos = self.eos, leven=leven, lodd=lodd, #ode_method='RK45',
                         ode_atol=1e-10, 
                         ode_rtol=1e-10, 
-                        dhfact=-1e-12)
+                        dhfact=-1e-12,
+                        ode_backend=self.ode_backend)
         m_list, r_list, c_list = np.zeros(len(self.p)), np.zeros(len(self.p)), np.zeros(len(self.p))
         k_vars, h_vars = {} , {}
         for l in leven:
