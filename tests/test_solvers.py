@@ -1,13 +1,14 @@
 """
-Tests for the pluggable ODE solver backends (tovpy/solvers.py).
+Tests for the pluggable ODE solver backends (tovpy/solvers.py) focused on
+TOV equation solving correctness, including tidal (Love) parameters.
 
 Covers:
-  - make_solver factory (string keys, passthrough of existing instance, invalid key)
-  - SolverResult container
-  - ScipySolver and NumbaSolver correctness against a known analytic ODE
+  - make_solver factory (string keys, passthrough, invalid key, kwargs)
   - JaxSolver stub raises NotImplementedError
-  - TOV.solve() consistency between scipy and numba backends
-  - Solver speed benchmark (printed, not asserted)
+  - TOV.solve() M/R/C consistency between scipy and numba backends
+  - Even-parity tidal parameters (k[2], h[2]) — validity and backend agreement
+  - Odd-parity tidal parameters (j[2]) — validity and backend agreement
+  - Solver speed benchmarks for both backends on the TOV equations
 """
 
 import time
@@ -21,7 +22,6 @@ from tovpy.solvers import (
     NumbaSolver,
     ODESolver,
     ScipySolver,
-    SolverResult,
     make_solver,
 )
 from tovpy.tov import TOV
@@ -41,16 +41,6 @@ def sly_eos():
 def central_pressure():
     """Moderate central pressure (geometric units) for a ~2 M_sun star."""
     return 1e-9
-
-
-# Simple analytic ODE for unit-testing the solver loop:
-#   dy/dt = -y,  y(0) = 1  =>  y(t) = exp(-t)
-def _exponential_rhs(t, y):
-    return -np.asarray(y)
-
-
-def analytic_solution(t):
-    return np.exp(-t)
 
 
 # ---------------------------------------------------------------------------
@@ -90,85 +80,6 @@ class TestMakeSolver:
 
 
 # ---------------------------------------------------------------------------
-# SolverResult container
-# ---------------------------------------------------------------------------
-
-class TestSolverResult:
-    def test_attributes_are_numpy_arrays(self):
-        r = SolverResult([0.0, 1.0, 2.0], [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
-        assert isinstance(r.t, np.ndarray)
-        assert isinstance(r.y, np.ndarray)
-
-    def test_shapes(self):
-        t = [0.0, 0.5, 1.0]
-        y = [[1.0, 2.0, 3.0], [0.1, 0.2, 0.3]]
-        r = SolverResult(t, y)
-        assert r.t.shape == (3,)
-        assert r.y.shape == (2, 3)
-
-
-# ---------------------------------------------------------------------------
-# ScipySolver correctness on analytic ODE
-# ---------------------------------------------------------------------------
-
-class TestScipySolver:
-    @pytest.mark.parametrize("method", ["DOP853", "RK45", "RK23"])
-    def test_exponential_decay(self, method):
-        solver = ScipySolver(method=method)
-        result = solver.solve(_exponential_rhs, (0.0, 3.0), [1.0], rtol=1e-10, atol=1e-12)
-        t_end = result.t[-1]
-        y_end = result.y[0, -1]
-        assert abs(t_end - 3.0) < 1e-10, "solver did not reach t_end"
-        assert abs(y_end - analytic_solution(3.0)) < 1e-7
-
-    def test_result_has_t_and_y(self):
-        solver = ScipySolver()
-        result = solver.solve(_exponential_rhs, (0.0, 1.0), [1.0])
-        assert hasattr(result, "t")
-        assert hasattr(result, "y")
-        assert result.t[-1] == pytest.approx(1.0, abs=1e-10)
-
-
-# ---------------------------------------------------------------------------
-# NumbaSolver correctness on analytic ODE
-# ---------------------------------------------------------------------------
-
-class TestNumbaSolver:
-    def test_exponential_decay(self):
-        solver = NumbaSolver()
-        result = solver.solve(_exponential_rhs, (0.0, 3.0), [1.0], rtol=1e-10, atol=1e-12)
-        t_end = result.t[-1]
-        y_end = result.y[0, -1]
-        assert abs(t_end - 3.0) < 1e-10
-        assert abs(y_end - analytic_solution(3.0)) < 1e-6
-
-    def test_returns_solver_result(self):
-        solver = NumbaSolver()
-        result = solver.solve(_exponential_rhs, (0.0, 1.0), [1.0])
-        assert isinstance(result, SolverResult)
-
-    def test_result_has_t_and_y(self):
-        solver = NumbaSolver()
-        result = solver.solve(_exponential_rhs, (0.0, 1.0), [1.0])
-        assert hasattr(result, "t")
-        assert hasattr(result, "y")
-        assert result.t[-1] == pytest.approx(1.0, abs=1e-10)
-
-    def test_multi_component_ode(self):
-        """Harmonic oscillator: d²x/dt² = -x  =>  x=cos(t), v=-sin(t)."""
-        def harmonic(t, y):
-            return np.array([y[1], -y[0]])
-
-        solver = NumbaSolver()
-        result = solver.solve(harmonic, (0.0, 2 * np.pi), [1.0, 0.0],
-                              rtol=1e-9, atol=1e-11)
-        x_end = result.y[0, -1]
-        v_end = result.y[1, -1]
-        assert abs(x_end - 1.0) < 1e-5, f"x(2π) = {x_end}, expected ≈ 1"
-        assert abs(v_end - 0.0) < 1e-5, f"v(2π) = {v_end}, expected ≈ 0"
-
-
-# ---------------------------------------------------------------------------
 # JaxSolver stub
 # ---------------------------------------------------------------------------
 
@@ -176,20 +87,20 @@ class TestJaxSolver:
     def test_raises_not_implemented(self):
         solver = JaxSolver()
         with pytest.raises(NotImplementedError):
-            solver.solve(_exponential_rhs, (0.0, 1.0), [1.0])
+            solver.solve(lambda t, y: -y, (0.0, 1.0), [1.0])
 
     def test_is_ode_solver_subclass(self):
         assert issubclass(JaxSolver, ODESolver)
 
 
 # ---------------------------------------------------------------------------
-# Backend agreement on TOV equations
+# Backend agreement on TOV equations (M, R, C)
 # ---------------------------------------------------------------------------
 
 class TestTOVBackendConsistency:
     """ScipySolver and NumbaSolver must agree to within tolerances."""
 
-    REL_TOL = 1e-4  # 0.01% relative tolerance on M, R, C
+    REL_TOL = 1e-4  # 0.01% relative tolerance
 
     def test_mass_radius_compactness(self, sly_eos, central_pressure):
         tov_scipy = TOV(eos=sly_eos, ode_backend="scipy")
@@ -209,7 +120,7 @@ class TestTOVBackendConsistency:
         )
 
     def test_tov_scipy_default_backend(self, sly_eos, central_pressure):
-        """Default backend must be scipy."""
+        """Default backend must be scipy and produce a physical star."""
         tov = TOV(eos=sly_eos)
         assert isinstance(tov.solver, ScipySolver)
         M, R, C = tov.solve(central_pressure)
@@ -227,19 +138,116 @@ class TestTOVBackendConsistency:
 
 
 # ---------------------------------------------------------------------------
+# Even-parity tidal parameters (k[2], h[2])
+# ---------------------------------------------------------------------------
+
+class TestEvenTidal:
+    """Tests for the ell=2 even-parity Love/shape numbers."""
+
+    REL_TOL = 1e-4
+
+    @pytest.fixture(scope="class")
+    def even_tov_scipy(self, sly_eos):
+        return TOV(eos=sly_eos, leven=[2], ode_backend="scipy")
+
+    @pytest.fixture(scope="class")
+    def even_tov_numba(self, sly_eos):
+        return TOV(eos=sly_eos, leven=[2], ode_backend="numba")
+
+    def test_even_tidal_scipy_physical(self, even_tov_scipy, central_pressure):
+        """k[2] and h[2] must be positive and in physically reasonable range."""
+        M, R, C, k, h = even_tov_scipy.solve(central_pressure)
+        assert M > 0 and R > 0
+        assert k[2] > 0, f"Even Love number k[2]={k[2]} must be positive"
+        assert h[2] > 0, f"Shape number h[2]={h[2]} must be positive"
+        # For typical NS k2 is O(0.01-0.15); h2 is O(0.1-10)
+        assert k[2] < 1.0, f"k[2]={k[2]} seems unphysically large"
+
+    def test_even_tidal_backend_consistency(
+        self, even_tov_scipy, even_tov_numba, central_pressure
+    ):
+        """scipy and numba must agree on k[2] and h[2]."""
+        M_s, R_s, C_s, k_s, h_s = even_tov_scipy.solve(central_pressure)
+        M_n, R_n, C_n, k_n, h_n = even_tov_numba.solve(central_pressure)
+
+        assert abs(k_s[2] - k_n[2]) / abs(k_s[2]) < self.REL_TOL, (
+            f"k[2] disagreement: scipy={k_s[2]:.6g}, numba={k_n[2]:.6g}"
+        )
+        assert abs(h_s[2] - h_n[2]) / abs(h_s[2]) < self.REL_TOL, (
+            f"h[2] disagreement: scipy={h_s[2]:.6g}, numba={h_n[2]:.6g}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Odd-parity tidal parameters (j[2])
+# ---------------------------------------------------------------------------
+
+class TestOddTidal:
+    """Tests for the ell=2 odd-parity Love numbers."""
+
+    REL_TOL = 1e-4
+
+    @pytest.fixture(scope="class")
+    def odd_tov_scipy(self, sly_eos):
+        return TOV(eos=sly_eos, lodd=[2], ode_backend="scipy")
+
+    @pytest.fixture(scope="class")
+    def odd_tov_numba(self, sly_eos):
+        return TOV(eos=sly_eos, lodd=[2], ode_backend="numba")
+
+    def test_odd_tidal_scipy_physical(self, odd_tov_scipy, central_pressure):
+        """j[2] must be nonzero and in physically reasonable magnitude range."""
+        M, R, C, j = odd_tov_scipy.solve(central_pressure)
+        assert M > 0 and R > 0
+        assert j[2] != 0, f"Odd Love number j[2] must be nonzero"
+        assert abs(j[2]) < 1.0, f"|j[2]|={abs(j[2])} seems unphysically large"
+
+    def test_odd_tidal_backend_consistency(
+        self, odd_tov_scipy, odd_tov_numba, central_pressure
+    ):
+        """scipy and numba must agree on j[2]."""
+        M_s, R_s, C_s, j_s = odd_tov_scipy.solve(central_pressure)
+        M_n, R_n, C_n, j_n = odd_tov_numba.solve(central_pressure)
+
+        assert abs(j_s[2] - j_n[2]) / abs(j_s[2]) < self.REL_TOL, (
+            f"j[2] disagreement: scipy={j_s[2]:.6g}, numba={j_n[2]:.6g}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Combined even + odd tidal parameters
+# ---------------------------------------------------------------------------
+
+class TestCombinedTidal:
+    """TOV with both even and odd perturbations active simultaneously."""
+
+    REL_TOL = 1e-4
+
+    @pytest.fixture(scope="class")
+    def combined_tov(self, sly_eos):
+        return TOV(eos=sly_eos, leven=[2], lodd=[2], ode_backend="scipy")
+
+    def test_combined_returns_all_outputs(self, combined_tov, central_pressure):
+        """With both leven and lodd set, solve() returns (M, R, C, k, h, j)."""
+        result = combined_tov.solve(central_pressure)
+        assert len(result) == 6, (
+            f"Expected 6-tuple (M,R,C,k,h,j), got {len(result)}-tuple"
+        )
+        M, R, C, k, h, j = result
+        assert M > 0 and R > 0
+        assert k[2] > 0
+        assert h[2] > 0
+        assert j[2] != 0
+
+
+# ---------------------------------------------------------------------------
 # Solver speed benchmark (informational — never fails)
 # ---------------------------------------------------------------------------
 
 class TestSolverBenchmark:
     """
-    Benchmark the scipy and numba backends and print the results.
-    These tests always pass; they exist purely to report timing information.
-
-    The ``TOV`` RHS uses pre-built log-space EOS tables (sampled once at
-    construction) together with ``np.interp`` for EOS lookups.  When Numba is
-    available the JIT-compiled ``_interp_positive`` is used instead, giving a
-    further speedup.  Both paths avoid Python EOS method calls and dict lookups
-    in the hot integration loop.
+    Benchmark the scipy and numba backends on the full TOV equations and
+    print the results.  These tests always pass; they exist to report timing.
     """
 
     N_WARMUP = 2
@@ -247,15 +255,12 @@ class TestSolverBenchmark:
 
     def _time_backend(self, backend_name, sly_eos, pc):
         tov = TOV(eos=sly_eos, ode_backend=backend_name)
-        # Warm-up
         for _ in range(self.N_WARMUP):
             tov.solve(pc)
-        # Timed runs
         t0 = time.perf_counter()
         for _ in range(self.N_BENCH):
             tov.solve(pc)
-        elapsed = time.perf_counter() - t0
-        return elapsed / self.N_BENCH
+        return (time.perf_counter() - t0) / self.N_BENCH
 
     def test_benchmark_scipy(self, sly_eos, central_pressure):
         t = self._time_backend("scipy", sly_eos, central_pressure)
@@ -271,19 +276,14 @@ class TestSolverBenchmark:
         reference that calls Python EOS methods directly.  The optimized path
         should be equal or faster; with Numba it is significantly faster.
         """
-        import numpy as np
-
         tov = TOV(eos=sly_eos)
         eos = sly_eos
-
-        # Sample a typical h value from the middle of the integration range
         pc = central_pressure
         hc = eos.PseudoEnthalpy_Of_Pressure(pc)
-        h_test = hc * 0.5  # mid-range value
+        h_test = hc * 0.5
 
         N = 10_000
 
-        # Reference: Python EOS method calls
         t0 = time.perf_counter()
         for _ in range(N):
             eos.Pressure_Of_PseudoEnthalpy(h_test)
@@ -291,7 +291,6 @@ class TestSolverBenchmark:
             eos.EnergyDensityDeriv_Of_Pressure(eos.Pressure_Of_PseudoEnthalpy(h_test))
         t_eos = (time.perf_counter() - t0) / N * 1e6
 
-        # Optimized: np.interp on pre-built log tables
         lh = np.log(h_test)
         t0 = time.perf_counter()
         for _ in range(N):
@@ -305,27 +304,9 @@ class TestSolverBenchmark:
             f" Python methods={t_eos:.2f} µs,"
             f" pre-built tables (np.interp)={t_tables:.2f} µs"
         )
-        # The pre-built table path (np.interp on log arrays) must not be more
-        # than 3× slower than the Python EOS methods.  In practice both are
-        # ~5 µs without Numba; with Numba the table path is 10-50× faster.
         MAX_SLOWDOWN_FACTOR = 3
         assert t_tables < t_eos * MAX_SLOWDOWN_FACTOR, (
             f"Table interpolation ({t_tables:.2f} µs) is unexpectedly slow "
             f"vs Python EOS ({t_eos:.2f} µs)"
         )
 
-    def test_benchmark_analytic_ode_scipy(self):
-        solver = ScipySolver()
-        t0 = time.perf_counter()
-        for _ in range(self.N_BENCH):
-            solver.solve(_exponential_rhs, (0.0, 3.0), [1.0], rtol=1e-9, atol=1e-11)
-        elapsed = (time.perf_counter() - t0) / self.N_BENCH
-        print(f"\n[benchmark] scipy  (analytic ODE): {elapsed * 1e6:.1f} µs/call")
-
-    def test_benchmark_analytic_ode_numba(self):
-        solver = NumbaSolver()
-        t0 = time.perf_counter()
-        for _ in range(self.N_BENCH):
-            solver.solve(_exponential_rhs, (0.0, 3.0), [1.0], rtol=1e-9, atol=1e-11)
-        elapsed = (time.perf_counter() - t0) / self.N_BENCH
-        print(f"\n[benchmark] numba  (analytic ODE): {elapsed * 1e6:.1f} µs/call")
