@@ -29,6 +29,7 @@ from . import eos
 from . import units
 from .eos import EOS
 from .units import Units
+from .solvers import make_solver
 
 class TOV(object):
     
@@ -56,7 +57,8 @@ class TOV(object):
                  dhfact     = -1e-12, # ODE step
                  ode_method = 'DOP853',
                  ode_atol   = 1e-9,
-                 ode_rtol   = 1e-9): 
+                 ode_rtol   = 1e-9,
+                 ode_backend = 'scipy'): # ODE solver backend: 'scipy', 'numba', 'jax', or ODESolver instance
 
         if not eos:
             raise ValueError("Must provide a EOS")
@@ -79,9 +81,19 @@ class TOV(object):
         if dhfact > 0.:
             raise ValueError("ODE timestep must be negative")
         self.dhfact = dhfact
+        # ode_method is only used by the scipy backend (forwarded to solve_ivp).
+        # It is retained for backward compatibility but has no effect on other backends.
         self.ode_method = ode_method        
         self.ode_atol = ode_atol
         self.ode_rtol = ode_rtol
+
+        # Instantiate the solver backend.  When ode_backend is 'scipy' the
+        # ode_method parameter selects the integration method; for other
+        # backends ode_method is ignored.
+        if ode_backend == 'scipy':
+            self.solver = make_solver('scipy', method=ode_method)
+        else:
+            self.solver = make_solver(ode_backend)
 
         
     def __buildvars(self):
@@ -235,9 +247,8 @@ class TOV(object):
         # Integrate
         # print("Integrating TOV equations")
         # print("h0 = {:.8e} h1 = {:.8e}".format(h0,h1))
-        sol = solve_ivp(self.__tov_rhs, [h0, h1], y,
+        sol = self.solver.solve(self.__tov_rhs, [h0, h1], y,
                         first_step = abs(self.dhfact),
-                        method = self.ode_method,
                         rtol = self.ode_rtol,
                         atol = self.ode_atol)
     
