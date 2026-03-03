@@ -141,14 +141,14 @@ class TOV(object):
         self.eos = eos
 
         leven = np.array(leven)
-        lodd  = np.array(lodd)
+        lodd = np.array(lodd)
 
         self.leven = leven[leven>1]
         self.lodd  = lodd[lodd>1]
 
         var = self.__buildvars()
         self.nvar = len(var)
-        self.var  = dict(zip(var, range(self.nvar)))
+        self.var = dict(zip(var, range(self.nvar)))
         self.ivar = {v: k for k, v in self.var.items()}
 
         if dhfact > 0.:
@@ -189,13 +189,13 @@ class TOV(object):
         """
         List of varnames
         """
-        v = ['r','m','nu']
+        v = ["r", "m", "nu"]
         for l in self.leven:
-            v.append('H{}'.format(l))
-            v.append('dH{}'.format(l))
+            v.append("H{}".format(l))
+            v.append("dH{}".format(l))
         for l in self.lodd:
-            v.append('Psi{}'.format(l))
-            v.append('dPsi{}'.format(l))
+            v.append("Psi{}".format(l))
+            v.append("dPsi{}".format(l))
         return v
 
     def _build_eos_tables(self, n_points=2000):
@@ -372,18 +372,20 @@ class TOV(object):
         div_r2   = div_r**2
         exp_lam  = 1.0 / (1.0 - 2.0 * m * div_r )
         if not dnu_dr:
-            dnu2 = (2.0 * (m + 4.0 * np.pi * r3 * p) / (r * (r - 2.0 * m)))**2
+            dnu2 = (2.0 * (m + 4.0 * np.pi * r3 * p) / (r * (r - 2.0 * m))) ** 2
         else:
             dnu2 = dnu_dr**2
-        C1 = 2.0/r + exp_lam * ( 2*m*div_r2 + 4*np.pi*r*(p-e) ) 
-        C0 = np.zeros(max(ell)+1)
+        C1 = 2.0 / r + exp_lam * (2 * m * div_r2 + 4 * np.pi * r * (p - e))
+        C0 = np.zeros(max(ell) + 1)
         for l in ell:
-            Lam = l*(l+1)
+            Lam = l * (l + 1)
             C0[l] = -dnu2
-            C0[l] += exp_lam * ( -Lam*div_r2 + 4*np.pi*( 5*e + 9*p + (e + p) * dedp ) ) 
+            C0[l] += exp_lam * (
+                -Lam * div_r2 + 4 * np.pi * (5 * e + 9 * p + (e + p) * dedp)
+            )
         return C1, C0
-                
-    def __pert_odd(self,ell,m,r,p,e,dedp):
+
+    def __pert_odd(self, ell, m, r, p, e, dedp):
         """
         Eq.(31) of Damour & Nagar, Phys. Rev. D 80, 084035 (2009)
         https://arxiv.org/abs/0906.0096
@@ -391,15 +393,15 @@ class TOV(object):
         """
         r2 = r**2
         r3 = r * r2
-        div_r = 1.0/r
+        div_r = 1.0 / r
         div_r2 = div_r**2
         div_r3 = div_r*div_r2
         exp_lam = 1.0 / (1.0 - 2.0 * m * div_r )
         C1 = exp_lam * ( 2*m + 4*np.pi*r3*(p-e) ) * div_r2
         C0 = np.zeros(max(ell)+1)
         for l in ell:
-            Lam = l*(l+1)
-            C0[l] = exp_lam*( -Lam*div_r2 + 6*m*div_r3 - 4*np.pi*(e-p) )
+            Lam = l * (l + 1)
+            C0[l] = exp_lam * (-Lam * div_r2 + 6 * m * div_r3 - 4 * np.pi * (e - p))
         return C1, C0
 
     def _apply_even_perts(self, dy, y, m, r, p, e, dedp, dr_dh, dnu_dr):
@@ -512,45 +514,138 @@ class TOV(object):
         elif not len(self.leven) and len(self.lodd):
             return M,R,C,j
         else:
-            return M,R,C
+            return M, R, C
+
+    # ------------------------------------------------------------------
+    # SPEED: run solve() for many central pressures in parallel
+    # ------------------------------------------------------------------
+    def solve_parallel(self, pc_array, n_jobs=-1):
+        """
+        Solve TOV for an array of central pressures in parallel.
+
+        Requires joblib (pip install joblib). Falls back to serial if unavailable.
+
+        Parameters
+        ----------
+        pc_array : array-like of central pressures
+        n_jobs   : number of parallel workers; -1 = all CPUs
+
+        Returns
+        -------
+        list of solve() return values, one per entry in pc_array.
+
+        Example
+        -------
+        results = tov.solve_parallel(pc_array)
+        M_arr = np.array([r[0] for r in results])
+        R_arr = np.array([r[1] for r in results])
+        """
+        if not _JOBLIB_AVAILABLE:
+            return [self.solve(pc) for pc in pc_array]
+        return Parallel(n_jobs=n_jobs)(_delayed(self.solve)(pc) for pc in pc_array)
 
     def __compute_legendre(self, c, l):
         """
         Computes Legendre function values returning Pl2(x), Ql2(x) and their derivatives at x = 1/c -1
         """
-        x = 1/c -1
-        L = np.linspace(0,l-1,l)
-        nP = -prod((2*l-1)/2-L)/gamma(l) * 2**l * l*(l-1)
-        nQ = gamma(l)/factorial2(2*l+1)*(l+1)*(l+2)
+        x = 1 / c - 1
+        L = np.linspace(0, l - 1, l)
+        nP = -prod((2 * l - 1) / 2 - L) / gamma(l) * 2**l * l * (l - 1)
+        nQ = gamma(l) / factorial2(2 * l + 1) * (l + 1) * (l + 2)
 
         Pl2 = 0
         dPl2 = 0
-        for i in np.linspace(2,l,l-2+1,dtype=int):
-            Pl2 = Pl2 + gamma(i)/gamma(i-2) * comb(l,i) * prod((l+i-1)/2-L) / gamma(l) * x**(i-2)
-            dPl2 = dPl2 + gamma(i)/gamma(i-2) * comb(l,i) * prod((l+i-1)/2-L) / gamma(l) * (i-2) * x**(i-3)
-        
-        dPl2 = 2**l*(-2*x)*Pl2/nP + 2**l*(1-x**2)*dPl2/nP
-        Pl2  = 2**l*(1-x**2)*Pl2/nP
+        for i in np.linspace(2, l, l - 2 + 1, dtype=int):
+            Pl2 = Pl2 + gamma(i) / gamma(i - 2) * comb(l, i) * prod(
+                (l + i - 1) / 2 - L
+            ) / gamma(l) * x ** (i - 2)
+            dPl2 = dPl2 + gamma(i) / gamma(i - 2) * comb(l, i) * prod(
+                (l + i - 1) / 2 - L
+            ) / gamma(l) * (i - 2) * x ** (i - 3)
 
-        Ql2  = 1/nQ * np.sqrt(np.pi)/2**(l+1) * gamma(l+3)/gamma(l+3/2) * (x**2-1)/x**(l+3) * hyp2f1((l+3)/2, (l+4)/2,l+3/2,1/x**2)
-        dQl2 = 1/nQ * np.sqrt(np.pi)/2**(l+1) * gamma(l+3)/gamma(l+3/2) * (2*x**(-2 - l)*hyp2f1((l+3)/2, (l+4)/2,l+3/2,1/x**2) +\
-                                                            (-3 - l)*x**(-4 - l)*(-1 + x**2)*hyp2f1((l+3)/2, (l+4)/2,l+3/2,1/x**2) -\
-                                                            (2*((l+3)/2)*((l+4)/2)*x**(-6 - l)*(-1 + x**2)*hyp2f1((l+3)/2+1, (l+4)/2+1,l+3/2+1,1/x**2)/(l+3/2)))
-        return Pl2,dPl2,Ql2,dQl2
-    
+        dPl2 = 2**l * (-2 * x) * Pl2 / nP + 2**l * (1 - x**2) * dPl2 / nP
+        Pl2 = 2**l * (1 - x**2) * Pl2 / nP
+
+        Ql2 = (
+            1
+            / nQ
+            * np.sqrt(np.pi)
+            / 2 ** (l + 1)
+            * gamma(l + 3)
+            / gamma(l + 3 / 2)
+            * (x**2 - 1)
+            / x ** (l + 3)
+            * hyp2f1((l + 3) / 2, (l + 4) / 2, l + 3 / 2, 1 / x**2)
+        )
+        dQl2 = (
+            1
+            / nQ
+            * np.sqrt(np.pi)
+            / 2 ** (l + 1)
+            * gamma(l + 3)
+            / gamma(l + 3 / 2)
+            * (
+                2
+                * x ** (-2 - l)
+                * hyp2f1((l + 3) / 2, (l + 4) / 2, l + 3 / 2, 1 / x**2)
+                + (-3 - l)
+                * x ** (-4 - l)
+                * (-1 + x**2)
+                * hyp2f1((l + 3) / 2, (l + 4) / 2, l + 3 / 2, 1 / x**2)
+                - (
+                    2
+                    * ((l + 3) / 2)
+                    * ((l + 4) / 2)
+                    * x ** (-6 - l)
+                    * (-1 + x**2)
+                    * hyp2f1((l + 3) / 2 + 1, (l + 4) / 2 + 1, l + 3 / 2 + 1, 1 / x**2)
+                    / (l + 3 / 2)
+                )
+            )
+        )
+        return Pl2, dPl2, Ql2, dQl2
+
     def __compute_psi(self, c, l):
-        x = 1/c
-        CoefficientP = poch(5, l-2) / poch (2-l, l-2) / poch(3+l, l-2) * gamma(l-2) * 2 ** (l-2)
-        CoefficientQ = -1 / (l+2)
-        psiP = x**3 * hyp2f1(2-l, 3+l, 5, x/2) * CoefficientP
-        psiQ = - (l+2) * x**(-1-l) * ((1+l) * x * hyp2f1(-1+l,2+l,2+2*l,2/x) + (-1+l)*hyp2f1(l,3+l,3+2*l,2/x) )/(1+l) * CoefficientQ
-        dPsiP = 3 * x**2 * hyp2f1(2-l, 3+l, 5, x/2) - 1/10 * (-6 + l + l**2) * x**3 * hyp2f1(3-l, 4+l, 6, x/2)
+        x = 1 / c
+        CoefficientP = (
+            poch(5, l - 2)
+            / poch(2 - l, l - 2)
+            / poch(3 + l, l - 2)
+            * gamma(l - 2)
+            * 2 ** (l - 2)
+        )
+        CoefficientQ = -1 / (l + 2)
+        psiP = x**3 * hyp2f1(2 - l, 3 + l, 5, x / 2) * CoefficientP
+        psiQ = (
+            -(l + 2)
+            * x ** (-1 - l)
+            * (
+                (1 + l) * x * hyp2f1(-1 + l, 2 + l, 2 + 2 * l, 2 / x)
+                + (-1 + l) * hyp2f1(l, 3 + l, 3 + 2 * l, 2 / x)
+            )
+            / (1 + l)
+            * CoefficientQ
+        )
+        dPsiP = 3 * x**2 * hyp2f1(2 - l, 3 + l, 5, x / 2) - 1 / 10 * (
+            -6 + l + l**2
+        ) * x**3 * hyp2f1(3 - l, 4 + l, 6, x / 2)
         dPsiP = dPsiP * CoefficientP
-        dPsiQ = 1/(1+l)/(3+2*l) * (2+l) * x**(-3-l) * (
-            l*(3+5*l+2*l**2)*x**2*hyp2f1(-1+l, 2+l, 2+2*l, 2/x) +
-            (-1+l)*(
-                (3+2*l)**2*x*hyp2f1(l, 3+l, 3+2*l, 2/x) +
-                2*l*(3+l)*hyp2f1(1+l, 4+l, 4+2*l, 2/x)
+        dPsiQ = (
+            1
+            / (1 + l)
+            / (3 + 2 * l)
+            * (2 + l)
+            * x ** (-3 - l)
+            * (
+                l
+                * (3 + 5 * l + 2 * l**2)
+                * x**2
+                * hyp2f1(-1 + l, 2 + l, 2 + 2 * l, 2 / x)
+                + (-1 + l)
+                * (
+                    (3 + 2 * l) ** 2 * x * hyp2f1(l, 3 + l, 3 + 2 * l, 2 / x)
+                    + 2 * l * (3 + l) * hyp2f1(1 + l, 4 + l, 4 + 2 * l, 2 / x)
+                )
             )
         )
         dPsiQ = dPsiQ * CoefficientQ
@@ -576,7 +671,7 @@ class TOV(object):
 
     def Compute_proper_radius(self, sol):
         """
-        Compute baryon mass
+        Compute proper radius
         """
         r = sol.y[self._i_r, :]
         m = sol.y[self._i_m, :]
@@ -584,125 +679,400 @@ class TOV(object):
         
     def __compute_Love_odd(self,ell,c,y):
         """
-        Compute odd parity Love numbers given 
+        Compute odd parity Love numbers given
         * the multipolar index ell
         * the compactness c
-        * the ratio y = R Psi(R)'/Psi(R) 
+        * the ratio y = R Psi(R)'/Psi(R)
         Eq.(61) of Damour & Nagar, Phys. Rev. D 80 084035 (2009)
         """
         c2 = c**2
-        c3 = c*c2
-        c4 = c*c3
-        c5 = c*c4
-        j = 0.
+        c3 = c * c2
+        c4 = c * c3
+        c5 = c * c4
+        j = 0.0
         if ell == 2:
             nj =  96*c5*(-1 + 2*c)*(-3 + y)
             dj =  5.*(2*c*(9 + 3*c*(-3 + y) + 2*c2*(-3 + y) + 2*c3*(-3 + y) - 3*y + 12*c4*(1 + y)) + 3*(-1 + 2*c)*(-3 + y)*np.log(1 - 2*c))
             j = nj/dj
         else:
-            PsiP, dPsiP, PsiQ, dPsiQ = self.__compute_psi(c,ell)
-            factor =  - c ** (2 * ell + 1)
+            PsiP, dPsiP, PsiQ, dPsiQ = self.__compute_psi(c, ell)
+            factor = -(c ** (2 * ell + 1))
             j = factor * (dPsiP - c * y * PsiP) / (dPsiQ - c * y * PsiQ)
         return j
-    
-    def __compute_Love_even(self,ell,c,y):
+
+    def __compute_Love_even(self, ell, c, y):
         """
-        Compute even parity Love numbers given 
+        Compute even parity Love numbers given
         * the multipolar index ell
         * the compactness c
-        * the ratio y = R H(R)'/H(R) 
+        * the ratio y = R H(R)'/H(R)
         Eq.(49) of Damour & Nagar, Phys. Rev. D 80 084035 (2009)
         """
         c2 = c**2
-        c3 = c*c2
-        c4 = c*c3
-        c5 = c*c4
-        c6 = c*c5
-        c7 = c*c6
-        c8 = c*c7
-        c9 = c*c8
-        c10 = c*c9
-        c11 = c*c10
-        c13 = c2*c11
-        c15 = c2*c13
-        c17 = c2*c15
-        k = 0.
-        if ell < 2: return k
+        c3 = c * c2
+        c4 = c * c3
+        c5 = c * c4
+        c6 = c * c5
+        c7 = c * c6
+        c8 = c * c7
+        c9 = c * c8
+        c10 = c * c9
+        c11 = c * c10
+        c13 = c2 * c11
+        c15 = c2 * c13
+        c17 = c2 * c15
+        k = 0.0
+        if ell < 2:
+            return k
         if ell == 2:
-            nk = (1-2*c)**2*(2+2*c*(y-1)-y)
-            dk = 2*c*(6-3*y+3*c*(5*y-8))+4*c3*(13-11*y+c*(3*y-2)+2*c2*(1+y)) + 3*(1-2*c)**2*(2-y+2*c*(y-1))*np.log(1-2*c)
-            k = 8*c5/5*nk/dk
+            nk = (1 - 2 * c) ** 2 * (2 + 2 * c * (y - 1) - y)
+            dk = (
+                2 * c * (6 - 3 * y + 3 * c * (5 * y - 8))
+                + 4 * c3 * (13 - 11 * y + c * (3 * y - 2) + 2 * c2 * (1 + y))
+                + 3 * (1 - 2 * c) ** 2 * (2 - y + 2 * c * (y - 1)) * np.log(1 - 2 * c)
+            )
+            k = 8 * c5 / 5 * nk / dk
         elif ell == 3:
-            nk = (1 - 2*c)**2*(-3 - 3*c*(-2 + y) + 2*c2*(-1 + y) + y)
-            dk = 2*c*(15*(-3 + y) + 4*c5*(1 + y) - 45*c*(-5 + 2*y) - 20*c3*(-9 + 7*y) + 2*c4*(-2 + 9*y) + 5*c2*(-72 + 37*y)) - 15*(1 - 2*c)**2*(-3 - 3*c*(-2 + y) + 2*c**2*(-1 + y) + y)*np.log(1.0/(1 - 2*c))
-            k = 8*c7/7*nk/dk
+            nk = (1 - 2 * c) ** 2 * (-3 - 3 * c * (-2 + y) + 2 * c2 * (-1 + y) + y)
+            dk = 2 * c * (
+                15 * (-3 + y)
+                + 4 * c5 * (1 + y)
+                - 45 * c * (-5 + 2 * y)
+                - 20 * c3 * (-9 + 7 * y)
+                + 2 * c4 * (-2 + 9 * y)
+                + 5 * c2 * (-72 + 37 * y)
+            ) - 15 * (1 - 2 * c) ** 2 * (
+                -3 - 3 * c * (-2 + y) + 2 * c2 * (-1 + y) + y
+            ) * np.log(
+                1.0 / (1 - 2 * c)
+            )
+            k = 8 * c7 / 7 * nk / dk
         elif ell == 4:
-            nk = (1 - 2*c)**2*(-7*(-4 + y) + 28*c*(-3 + y) - 34*c2*(-2 + y) + 12*c3*(-1 + y))
-            dk = (2*c*(c2*(5360 - 1910*y) + c4*(1284 - 996*y) - 105*(-4 + y) + 8*c6*(1 + y) + 105*c*(-24 + 7*y) + 40*c3*(-116 + 55*y) + c5*(-8 + 68*y)) - 15*(1 - 2*c)**2*(-7*(-4 + y) + 28*c*(-3 + y) - 34*c2*(-2 + y) + 12*c3*(-1 + y))*np.log(1.0/(1 - 2*c)))
-            k = 32*c9/147*nk/dk
+            nk = (1 - 2 * c) ** 2 * (
+                -7 * (-4 + y)
+                + 28 * c * (-3 + y)
+                - 34 * c2 * (-2 + y)
+                + 12 * c3 * (-1 + y)
+            )
+            dk = 2 * c * (
+                c2 * (5360 - 1910 * y)
+                + c4 * (1284 - 996 * y)
+                - 105 * (-4 + y)
+                + 8 * c6 * (1 + y)
+                + 105 * c * (-24 + 7 * y)
+                + 40 * c3 * (-116 + 55 * y)
+                + c5 * (-8 + 68 * y)
+            ) - 15 * (1 - 2 * c) ** 2 * (
+                -7 * (-4 + y)
+                + 28 * c * (-3 + y)
+                - 34 * c2 * (-2 + y)
+                + 12 * c3 * (-1 + y)
+            ) * np.log(
+                1.0 / (1 - 2 * c)
+            )
+            k = 32 * c9 / 147 * nk / dk
         elif ell == 5:
-            nk = (32*(1 - 2*c)**2*c11*(3*(-5 + y) - 15*c*(-4 + y) + 26*c2*(-3 + y) - 18*c3*(-2 + y) + 4*c4*(-1 + y)))
-            dk = 99.*(2*c*(315*(-5 + y) + 8*c7*(1 + y) - 315*c*(-35 + 8*y) + 4*c6*(-2 + 27*y) - 56*c5*(-60 + 47*y) - 210*c3*(-170 + 57*y) + 105*c2*(-278 + 75*y) + 56*c4*(-345 + 158*y)) - 105*(1 - 2*c)**2*(3*(-5 + y) - 15*c*(-4 + y) + 26*c2*(-3 + y) - 18*c3*(-2 + y) + 4*c4*(-1 + y))*np.log(1.0/(1 - 2*c)))
-            k = nk/dk
+            nk = (
+                32
+                * (1 - 2 * c) ** 2
+                * c11
+                * (
+                    3 * (-5 + y)
+                    - 15 * c * (-4 + y)
+                    + 26 * c2 * (-3 + y)
+                    - 18 * c3 * (-2 + y)
+                    + 4 * c4 * (-1 + y)
+                )
+            )
+            dk = 99.0 * (
+                2
+                * c
+                * (
+                    315 * (-5 + y)
+                    + 8 * c7 * (1 + y)
+                    - 315 * c * (-35 + 8 * y)
+                    + 4 * c6 * (-2 + 27 * y)
+                    - 56 * c5 * (-60 + 47 * y)
+                    - 210 * c3 * (-170 + 57 * y)
+                    + 105 * c2 * (-278 + 75 * y)
+                    + 56 * c4 * (-345 + 158 * y)
+                )
+                - 105
+                * (1 - 2 * c) ** 2
+                * (
+                    3 * (-5 + y)
+                    - 15 * c * (-4 + y)
+                    + 26 * c2 * (-3 + y)
+                    - 18 * c3 * (-2 + y)
+                    + 4 * c4 * (-1 + y)
+                )
+                * np.log(1.0 / (1 - 2 * c))
+            )
+            k = nk / dk
         elif ell == 6:
-            nk = (1024*(1 - 2*c)**2*c13*(-33*(-6 + y) + 198*c*(-5 + y) - 444*c2*(-4 + y) + 456*c3*(-3 + y) - 208*c4*(-2 + y) + 32*c5*(-1 + y)))
-            dk = 14157.*(2*c*(-3465*(-6 + y) + 32*c8*(1 + y) + 10395*c*(-16 + 3*y) + 16*c7*(-2 + 39*y) + 2016*c5*(-122 + 55*y) - 64*c6*(-457 + 362*y) - 210*c2*(-2505 + 541*y)  + 210*c3*(-3942 + 1015*y) - 84*c4*(-7917 + 2567*y)) - 105*(1 - 2*c)**2*(-33*(-6 + y) + 198*c*(-5 + y) - 444*c2*(-4 + y) + 456*c3*(-3 + y) - 208*c4*(-2 + y) + 32*c5*(-1 + y))*np.log(1.0/(1 - 2*c)))
-            k = nk/dk
+            nk = (
+                1024
+                * (1 - 2 * c) ** 2
+                * c13
+                * (
+                    -33 * (-6 + y)
+                    + 198 * c * (-5 + y)
+                    - 444 * c2 * (-4 + y)
+                    + 456 * c3 * (-3 + y)
+                    - 208 * c4 * (-2 + y)
+                    + 32 * c5 * (-1 + y)
+                )
+            )
+            dk = 14157.0 * (
+                2
+                * c
+                * (
+                    -3465 * (-6 + y)
+                    + 32 * c8 * (1 + y)
+                    + 10395 * c * (-16 + 3 * y)
+                    + 16 * c7 * (-2 + 39 * y)
+                    + 2016 * c5 * (-122 + 55 * y)
+                    - 64 * c6 * (-457 + 362 * y)
+                    - 210 * c2 * (-2505 + 541 * y)
+                    + 210 * c3 * (-3942 + 1015 * y)
+                    - 84 * c4 * (-7917 + 2567 * y)
+                )
+                - 105
+                * (1 - 2 * c) ** 2
+                * (
+                    -33 * (-6 + y)
+                    + 198 * c * (-5 + y)
+                    - 444 * c2 * (-4 + y)
+                    + 456 * c3 * (-3 + y)
+                    - 208 * c4 * (-2 + y)
+                    + 32 * c5 * (-1 + y)
+                )
+                * np.log(1.0 / (1 - 2 * c))
+            )
+            k = nk / dk
         elif ell == 7:
-            nk = 1024*(1 - 2*c)**2*c15*(143*(-7 + y) - 1001*c*(-6 + y) + 2750*c2*(-5 + y) - 3740*c3*(-4 + y) + 2600*c4*(-3 + y) - 848*c5*(-2 + y) + 96*c6*(-1 + y))
-            dk = 20449.*(2*c*(45045*(-7 + y) + 160*c9*(1 + y) - 45045*c*(-63 + 10*y) + 80*c8*(-2 + 53*y) - 432*c7*(-651 + 521*y) - 4620*c3*(-4333 + 902*y)  + 1155*c2*(-9028 + 1621*y) + 96*c6*(-33964 + 15203*y) + 126*c4*(-168858 + 42239*y) - 84*c5*(-144545 + 45971*y)) - 315*(1 - 2*c)**2*(143*(-7 + y) - 1001*c*(-6 + y) + 2750*c2*(-5 + y) - 3740*c3*(-4 + y) + 2600*c4*(-3 + y) - 848*c5*(-2 + y) + 96*c6*(-1 + y))*np.log(1.0/(1 - 2*c)))
-            k = nk/dk
+            nk = (
+                1024
+                * (1 - 2 * c) ** 2
+                * c15
+                * (
+                    143 * (-7 + y)
+                    - 1001 * c * (-6 + y)
+                    + 2750 * c2 * (-5 + y)
+                    - 3740 * c3 * (-4 + y)
+                    + 2600 * c4 * (-3 + y)
+                    - 848 * c5 * (-2 + y)
+                    + 96 * c6 * (-1 + y)
+                )
+            )
+            dk = 20449.0 * (
+                2
+                * c
+                * (
+                    45045 * (-7 + y)
+                    + 160 * c9 * (1 + y)
+                    - 45045 * c * (-63 + 10 * y)
+                    + 80 * c8 * (-2 + 53 * y)
+                    - 432 * c7 * (-651 + 521 * y)
+                    - 4620 * c3 * (-4333 + 902 * y)
+                    + 1155 * c2 * (-9028 + 1621 * y)
+                    + 96 * c6 * (-33964 + 15203 * y)
+                    + 126 * c4 * (-168858 + 42239 * y)
+                    - 84 * c5 * (-144545 + 45971 * y)
+                )
+                - 315
+                * (1 - 2 * c) ** 2
+                * (
+                    143 * (-7 + y)
+                    - 1001 * c * (-6 + y)
+                    + 2750 * c2 * (-5 + y)
+                    - 3740 * c3 * (-4 + y)
+                    + 2600 * c4 * (-3 + y)
+                    - 848 * c5 * (-2 + y)
+                    + 96 * c6 * (-1 + y)
+                )
+                * np.log(1.0 / (1 - 2 * c))
+            )
+            k = nk / dk
         elif ell == 8:
-            nk = (16*(1 - 2*c)**2*(2*c*(c*(2*c*(2*c*(-737*(-4 + y) + 374*c*(-3 + y) - 92*c2*(-2 + y) + 8*c**3*(-1 + y)) + 1573*(-5 + y)) - 1859*(-6 + y)) + 572*(-7 + y)) - 143*(-8 + y)))
-            dk = (286*c*(4*(90090 + c*(-900900 + c*(3768765 + c*(-8528520 + c*(11259633 + 2*c*(-4349499 + c*(1858341 + 8*c*(-47328 + c*(3092 + (-1 + c)*c))))))))) + (-1 + c)*(-1 + 2*c)*(-45045 + 4*c*(90090 + c*(-285285 + c*(450450 + c*(-365211 + 4*c*(34881 + c*(-4887 + 2*c*(36 + c))))))))*y) - 45045*(1 - 2*c)**2*(2*c*(c*(2*c*(2*c*(-737*(-4 + y) + 374*c*(-3 + y) - 92*c2*(-2 + y) + 8*c**3*(-1 + y)) + 1573*(-5 + y)) - 1859*(-6 + y)) + 572*(-7 + y)) - 143*(-8 + y))*np.log(1.0/(1 - 2*c)))
-            k = 256/2431 * c17 * nk/dk
+            nk = (
+                16
+                * (1 - 2 * c) ** 2
+                * (
+                    2
+                    * c
+                    * (
+                        c
+                        * (
+                            2
+                            * c
+                            * (
+                                2
+                                * c
+                                * (
+                                    -737 * (-4 + y)
+                                    + 374 * c * (-3 + y)
+                                    - 92 * c2 * (-2 + y)
+                                    + 8 * c**3 * (-1 + y)
+                                )
+                                + 1573 * (-5 + y)
+                            )
+                            - 1859 * (-6 + y)
+                        )
+                        + 572 * (-7 + y)
+                    )
+                    - 143 * (-8 + y)
+                )
+            )
+            dk = 286 * c * (
+                4
+                * (
+                    90090
+                    + c
+                    * (
+                        -900900
+                        + c
+                        * (
+                            3768765
+                            + c
+                            * (
+                                -8528520
+                                + c
+                                * (
+                                    11259633
+                                    + 2
+                                    * c
+                                    * (
+                                        -4349499
+                                        + c
+                                        * (
+                                            1858341
+                                            + 8
+                                            * c
+                                            * (-47328 + c * (3092 + (-1 + c) * c))
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                    )
+                )
+                + (-1 + c)
+                * (-1 + 2 * c)
+                * (
+                    -45045
+                    + 4
+                    * c
+                    * (
+                        90090
+                        + c
+                        * (
+                            -285285
+                            + c
+                            * (
+                                450450
+                                + c
+                                * (
+                                    -365211
+                                    + 4 * c * (34881 + c * (-4887 + 2 * c * (36 + c)))
+                                )
+                            )
+                        )
+                    )
+                )
+                * y
+            ) - 45045 * (1 - 2 * c) ** 2 * (
+                2
+                * c
+                * (
+                    c
+                    * (
+                        2
+                        * c
+                        * (
+                            2
+                            * c
+                            * (
+                                -737 * (-4 + y)
+                                + 374 * c * (-3 + y)
+                                - 92 * c2 * (-2 + y)
+                                + 8 * c**3 * (-1 + y)
+                            )
+                            + 1573 * (-5 + y)
+                        )
+                        - 1859 * (-6 + y)
+                    )
+                    + 572 * (-7 + y)
+                )
+                - 143 * (-8 + y)
+            ) * np.log(
+                1.0 / (1 - 2 * c)
+            )
+            k = 256 / 2431 * c17 * nk / dk
         else:
             Pl2, dPl2, Ql2, dQl2 = self.__compute_legendre(c, ell)
-            k = -1/2*c**(2*ell+1)*(dPl2-c*y*Pl2)/(dQl2-c*y*Ql2)
+            k = (
+                -1
+                / 2
+                * c ** (2 * ell + 1)
+                * (dPl2 - c * y * Pl2)
+                / (dQl2 - c * y * Ql2)
+            )
         return k
-        
-    def __compute_shape(self,ell,c,y):
+
+    def __compute_shape(self, ell, c, y):
         """
-        Compute even shape numbers given 
+        Compute even shape numbers given
         * the multipolar index ell
         * the compactness c
-        * the ratio y = R H(R)'/H(R) 
+        * the ratio y = R H(R)'/H(R)
         Eq.(95) of Damour & Nagar, Phys. Rev. D 80 084035 (2009)
         """
         c2 = c**2
-        c3 = c*c2
-        c4 = c*c3
-        c5 = c*c4
-        c6 = c*c5
-        c7 = c*c6
-        c8 = c*c7
-        c9 = c*c8
-        c10 = c*c9
-        c11 = c*c10
-        c13 = c2*c11
-        c15 = c2*c13
-        c17 = c2*c15
-        h = 0.
-        if ell < 2: return h
+        c3 = c * c2
+        c4 = c * c3
+        c5 = c * c4
+        c6 = c * c5
+        c7 = c * c6
+        c8 = c * c7
+        c9 = c * c8
+        c10 = c * c9
+        c11 = c * c10
+        c13 = c2 * c11
+        c15 = c2 * c13
+        c17 = c2 * c15
+        h = 0.0
+        if ell < 2:
+            return h
         if ell == 2:
             nh = (-2 + 6*c + 2*c3*(1 + y) - c2*(6 + y))
             dh = (2*c*(6 + c2*(26 - 22*y) - 3*y + 4*c4*(1 + y) + 3*c*(-8 + 5*y) + c3*(-4 + 6*y)) - 3*(1 - 2*c)**2*(2 + 2*c*(-1 + y) - y)*np.log(1.0/(1 - 2*c)))
             h = -8*c5*nh/dh
         else:
-            Pl2, dPl2, Ql2, dQl2 = self.__compute_legendre(c,ell)
-            term1 = (1-2*c)/c
-            term2 = 1/(ell-1)/(ell+2) * (2*c*y + ell*(ell+1) + 4*c**2/(1-2*c) - 2*(1-2*c))
-            factor = c**(ell+1)*Pl2 * (1-(dPl2/Pl2-c*y)/(dQl2/Ql2-c*y))
+            Pl2, dPl2, Ql2, dQl2 = self.__compute_legendre(c, ell)
+            term1 = (1 - 2 * c) / c
+            term2 = (
+                1
+                / (ell - 1)
+                / (ell + 2)
+                * (
+                    2 * c * y
+                    + ell * (ell + 1)
+                    + 4 * c**2 / (1 - 2 * c)
+                    - 2 * (1 - 2 * c)
+                )
+            )
+            factor = (
+                c ** (ell + 1) * Pl2 * (1 - (dPl2 / Pl2 - c * y) / (dQl2 / Ql2 - c * y))
+            )
             h = (term1 + term2) * factor
         return h
-    
-    def Compute_Lambda(self,ell,k,C):
+
+    def Compute_Lambda(self, ell, k, C):
         r"""
         Compute tidal polarizability $\Lambda_\ell$
         from Love numbers and compactness
         Note: Yagi's $\bar{\lambda}_\ell$ is $\Lambda_\ell$
         """
-        div = 1.0/(factorial2(2*ell-1)*C**(2*ell+1))
-        return 2.*k*div
-
-
+        div = 1.0 / (factorial2(2 * ell - 1) * C ** (2 * ell + 1))
+        return 2.0 * k * div
