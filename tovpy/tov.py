@@ -31,6 +31,40 @@ from .eos import EOS
 from .units import Units
 from .solvers import make_solver
 
+# ---------------------------------------------------------------------------
+# Optional Numba JIT — transparent no-op fallback if not installed
+# ---------------------------------------------------------------------------
+try:
+    from numba import njit as _njit
+    _NUMBA_AVAILABLE = True
+except ImportError:
+    def _njit(*args, **kwargs):
+        if len(args) == 1 and callable(args[0]):
+            return args[0]
+        def decorator(fn):
+            return fn
+        return decorator
+    _NUMBA_AVAILABLE = False
+
+
+@_njit(cache=True)
+def _interp_positive(val, x_table, y_table):
+    """
+    Log-log linear interpolation on a strictly positive, monotonically
+    increasing *x_table* (stored as log values).  Both *val* and all table
+    entries must be > 0.
+    """
+    lv = np.log(val)
+    lo, hi = 0, len(x_table) - 1
+    while hi - lo > 1:
+        mid = (lo + hi) >> 1
+        if x_table[mid] <= lv:
+            lo = mid
+        else:
+            hi = mid
+    t = (lv - x_table[lo]) / (x_table[hi] - x_table[lo])
+    return np.exp(y_table[lo] + t * (y_table[hi] - y_table[lo]))
+
 class TOV(object):
     
     """ 
@@ -95,6 +129,22 @@ class TOV(object):
         else:
             self.solver = make_solver(ode_backend)
 
+        # Cache integer indices for hot-path RHS (avoids dict lookups per step)
+        self._i_r   = self.var['r']
+        self._i_m   = self.var['m']
+        self._i_nu  = self.var['nu']
+        self._even_idx = [
+            (self.var['H{}'.format(l)], self.var['dH{}'.format(l)])
+            for l in self.leven
+        ]
+        self._odd_idx = [
+            (self.var['Psi{}'.format(l)], self.var['dPsi{}'.format(l)])
+            for l in self.lodd
+        ]
+
+        # Pre-build EOS tables for fast log-log interpolation in the RHS
+        self._build_eos_tables()
+
         
     def __buildvars(self):
         """
@@ -108,6 +158,48 @@ class TOV(object):
             v.append('Psi{}'.format(l))
             v.append('dPsi{}'.format(l))
         return v
+
+    def _build_eos_tables(self, n_points=2000):
+        """
+        Pre-sample the EOS once at construction and store log-space 1-D arrays
+        for use in the fast RHS interpolation path.
+
+        Tables stored (all 1-D, contiguous, float64):
+          _log_h    : log(h) values (sorted ascending)
+          _log_p    : log(p) values (same ordering as h)
+          _log_e    : log(e) values
+          _log_dedp : log(dedp) values, sorted by ascending log(p)
+          _log_p_sorted : log(p) sorted ascending (key for dedp lookup)
+        """
+        try:
+            p_min = float(self.eos.p_min) * 1.001  # small buffer avoids interpolation boundary issues
+            p_max = float(self.eos.p_max) * 0.999  # stay inside the EOS support range
+        except AttributeError:
+            p_min = 1e-19
+            p_max = 1e-8
+
+        p_arr    = np.logspace(np.log10(p_min), np.log10(p_max), n_points)
+        h_arr    = np.array([self.eos.PseudoEnthalpy_Of_Pressure(p) for p in p_arr])
+        e_arr    = np.array([self.eos.EnergyDensity_Of_Pressure(p)  for p in p_arr])
+        dedp_arr = np.array([self.eos.EnergyDensityDeriv_Of_Pressure(p) for p in p_arr])
+
+        valid = (h_arr > 0) & (e_arr > 0) & (dedp_arr > 0) & (p_arr > 0)
+        h_arr    = h_arr[valid];    p_arr    = p_arr[valid]
+        e_arr    = e_arr[valid];    dedp_arr = dedp_arr[valid]
+
+        idx   = np.argsort(h_arr)
+        h_arr = h_arr[idx];  p_arr = p_arr[idx]
+        e_arr = e_arr[idx];  dedp_arr = dedp_arr[idx]
+
+        self._log_h    = np.ascontiguousarray(np.log(h_arr))
+        self._log_p    = np.ascontiguousarray(np.log(p_arr))
+        self._log_e    = np.ascontiguousarray(np.log(e_arr))
+
+        # dedp keyed by pressure (already sorted by h ≈ sorted by p)
+        p_idx = np.argsort(p_arr)
+        self._log_p_sorted = np.ascontiguousarray(np.log(p_arr[p_idx]))
+        self._log_dedp     = np.ascontiguousarray(np.log(dedp_arr[p_idx]))
+
     
     def __pert_even(self,ell,m,r,p,e,dedp,dnu_dr=[]):
         """
@@ -157,45 +249,51 @@ class TOV(object):
         Implements Eqs. (5) and (6) of Lindblom, Astrophys. J. 398, 569 (1992).
         Also uses Eqs. (7) and (8) [ibid] for inner boundary data, and
         Eqs. (18), (27), (28) of Damour & Nagar, Phys. Rev. D 80, 084035 (2009)
-        for the metric perturbation used to obtain the Love number. 
+        for the metric perturbation used to obtain the Love number.
+
+        Uses cached integer indices and pre-built log-space EOS tables to avoid
+        dict lookups on every step.  When Numba is available the JIT-compiled
+        ``_interp_positive`` is used; otherwise ``np.interp`` is used.
         """
         dy = np.zeros_like(y)
-        # Unpack y
-        r  = y[self.var['r']]
-        m  = y[self.var['m']]
-        # EOS call
-        p    = self.eos.Pressure_Of_PseudoEnthalpy(h)
-        e    = self.eos.EnergyDensity_Of_PseudoEnthalpy(h)
-        dedp = self.eos.EnergyDensityDeriv_Of_Pressure(p)
-        # print(f'vars: r:{r} m:{m} h:{h} p:{p} e:{e}')
+        # Cached integer indices — no dict lookup
+        r = y[self._i_r]
+        m = y[self._i_m]
+        # EOS via pre-built log tables
+        if _NUMBA_AVAILABLE:
+            # JIT-compiled binary search: O(log n) with no Python overhead
+            p    = _interp_positive(h, self._log_h, self._log_p)
+            e    = _interp_positive(h, self._log_h, self._log_e)
+            dedp = _interp_positive(p, self._log_p_sorted, self._log_dedp)
+        else:
+            # np.interp is C-implemented and faster than a pure-Python loop
+            lh = np.log(h)
+            p    = np.exp(np.interp(lh, self._log_h, self._log_p))
+            e    = np.exp(np.interp(lh, self._log_h, self._log_e))
+            dedp = np.exp(np.interp(np.log(p), self._log_p_sorted, self._log_dedp))
         # TOV
         dr_dh  = -r * (r - 2.0 * m)/(m + 4.0*np.pi*r**3*p)
-        dm_dh  = 4.0 * np.pi * r**2 * e * dr_dh 
+        dm_dh  = 4.0 * np.pi * r**2 * e * dr_dh
         dnu_dr =  2.0 * (m + 4.0 * np.pi * r**3 * p) / (r * (r - 2.0 * m))
-        dy[self.var['r']] = dr_dh
-        dy[self.var['m']] = dm_dh
-        dy[self.var['nu']] = dnu_dr * dr_dh        
-        # print('derivs:', dr_dh, dm_dh, dnu_dr)
+        dy[self._i_r]  = dr_dh
+        dy[self._i_m]  = dm_dh
+        dy[self._i_nu] = dnu_dr * dr_dh
         # Even perturbations
         if len(self.leven) != 0:
             C1,C0 = self.__pert_even(self.leven,m,r,p,e,dedp,dnu_dr)
-            for l in self.leven:
-                H = y[self.var['H{}'.format(l)]]
-                dH = y[self.var['dH{}'.format(l)]]
-                dH_dh = dH * dr_dh
-                ddH_dh = -(C0[l] * H + C1 * dH) * dr_dh
-                dy[self.var['H{}'.format(l)]] = dH_dh
-                dy[self.var['dH{}'.format(l)]] = ddH_dh    
+            for l, (iH, idH) in zip(self.leven, self._even_idx):
+                H  = y[iH]
+                dH = y[idH]
+                dy[iH]  = dH * dr_dh
+                dy[idH] = -(C0[l] * H + C1 * dH) * dr_dh
         # Odd perturbations
         if len(self.lodd) != 0:
             C1,C0 = self.__pert_odd(self.lodd,m,r,p,e,dedp)
-            for l in self.lodd:
-                Psi  = y[self.var['Psi{}'.format(l)]]
-                dPsi = y[self.var['dPsi{}'.format(l)]]
-                dPsi_dh = dPsi * dr_dh
-                ddPsi_dh = -(C0[l] * Psi + C1 * dPsi) * dr_dh
-                dy[self.var['Psi{}'.format(l)]] = dPsi_dh
-                dy[self.var['dPsi{}'.format(l)]] = ddPsi_dh   
+            for l, (iPsi, idPsi) in zip(self.lodd, self._odd_idx):
+                Psi  = y[iPsi]
+                dPsi = y[idPsi]
+                dy[iPsi]  = dPsi * dr_dh
+                dy[idPsi] = -(C0[l] * Psi + C1 * dPsi) * dr_dh
         return dy
 
     def __initial_data(self,pc,dh_fact=-1e-12,verbose=False):
@@ -225,13 +323,13 @@ class TOV(object):
         #  Initial data for the ell-perturbation
         a0 = 1.0
         if len(self.leven)!= 0:
-            for l in self.leven:
-                y[self.var['H{}'.format(l)]] = a0 * r0**l
-                y[self.var['dH{}'.format(l)]] = a0 * l * r0**(l-1)
+            for l, (iH, idH) in zip(self.leven, self._even_idx):
+                y[iH]  = a0 * r0**l
+                y[idH] = a0 * l * r0**(l-1)
         if len(self.lodd)!= 0:
-            for l in self.lodd:
-                y[self.var['Psi{}'.format(l)]] = a0 * r0**(l+1)
-                y[self.var['dPsi{}'.format(l)]] = a0 * (l+1) * r0**l
+            for l, (iPsi, idPsi) in zip(self.lodd, self._odd_idx):
+                y[iPsi]  = a0 * r0**(l+1)
+                y[idPsi] = a0 * (l+1) * r0**l
         # if verbose:
         #     print("pc = {:.8e} hc = {:.8e} dh = {:.8e} h0  = {:.8e}".format(pc,hc,dh,h0))
         #     print(y, self.ivar)
@@ -261,24 +359,20 @@ class TOV(object):
         M,R,C = self.__compute_mass_radius(y)
         # Match to Schwarzschild exterior
         sol.y[self.var['nu'],:] += np.log(1.0-(2.*M)/R) - sol.y[self.var['nu'],-1]
-        # Even Love number k2 (for testing purposes only)
-        #yyl = R*y[self.ivar['dH2']]/y[self.ivar['H2']]
-        #k2 = self.__compute_Love_even_ell2(self, self.C,yyl)
-        # Even Love numbers
 
         self.sol = sol
         if len(self.leven) != 0:
             k, h = {}, {}
-            for l in self.leven:
-                yyl = R * y[self.var['dH{}'.format(l)]] / y[self.var['H{}'.format(l)]]
-                k[l] = self.__compute_Love_even(l,C,yyl)   
+            for l, (iH, idH) in zip(self.leven, self._even_idx):
+                yyl = R * y[idH] / y[iH]
+                k[l] = self.__compute_Love_even(l,C,yyl)
                 h[l] = self.__compute_shape(l,C,yyl)
-        if len(self.lodd) != 0:                
-        # Odd Love numbers
+        if len(self.lodd) != 0:
+            # Odd Love numbers
             j = {}
-            for l in self.lodd:
-                yyl = R*y[self.var['dPsi{}'.format(l)]]/y[self.var['Psi{}'.format(l)]]
-                j[l]= self.__compute_Love_odd(l,C,yyl)
+            for l, (iPsi, idPsi) in zip(self.lodd, self._odd_idx):
+                yyl = R * y[idPsi] / y[iPsi]
+                j[l] = self.__compute_Love_odd(l,C,yyl)
 
         if len(self.leven)!= 0 and len(self.lodd)!= 0:
             return M,R,C,k,h,j
@@ -335,8 +429,8 @@ class TOV(object):
         """
         Compute mass, radius, & compactness
         """
-        R = y[self.var['r']]
-        M = y[self.var['m']]
+        R = y[self._i_r]
+        M = y[self._i_m]
         return M,R,M/R
 
     def Compute_baryon_mass(self, sol):
