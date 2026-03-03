@@ -18,11 +18,16 @@ parser.add_argument(
 parser.add_argument(
     "--np", default=50, type=int, help="number of central pressure points"
 )
+parser.add_argument(
+    "--backend", default="scipy", choices=["scipy", "numba", "jax"],
+    help="ODE solver backend (default: scipy)"
+)
 parser.add_argument("-o", "--output", help="Output filename")
 args = parser.parse_args()
 
 eos = EOSTabular("tabular", filename=args.eos)
-utils = Utils(eos=eos, p=np.logspace(args.pmin, args.pmax, args.np), path=".")
+utils = Utils(eos=eos, p=np.logspace(args.pmin, args.pmax, args.np), path=".",
+              ode_backend=args.backend)
 
 leven = [2, 3, 4]  # even-parity multipoles (example values)
 lodd  = [2, 3, 4]  # odd-parity multipoles (example values)

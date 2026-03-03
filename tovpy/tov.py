@@ -16,151 +16,35 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 """
 
 import numpy as np
-from numpy import log
-from scipy.integrate import solve_ivp
-from scipy.special import factorial2, gamma, factorial2, hyp2f1, poch
+from scipy.special import factorial2, gamma, hyp2f1, poch
 from math import comb, prod
 
-# ---------------------------------------------------------------------------
-# Optional joblib parallelism
-# ---------------------------------------------------------------------------
-try:
-    from joblib import Parallel, delayed as _delayed
-
-    _JOBLIB_AVAILABLE = True
-except ImportError:
-    _JOBLIB_AVAILABLE = False
+from .solvers import make_solver
 
 # ---------------------------------------------------------------------------
 # Optional Numba JIT — transparent no-op fallback if not installed
 # ---------------------------------------------------------------------------
 try:
     from numba import njit as _njit
-
     _NUMBA_AVAILABLE = True
 except ImportError:
-
     def _njit(*args, **kwargs):
         if len(args) == 1 and callable(args[0]):
             return args[0]
-
         def decorator(fn):
             return fn
-
         return decorator
-
     _NUMBA_AVAILABLE = False
-
-from numba import njit
-import numpy as np
-from math import pi
-
-
-@njit(cache=True, fastmath=True)
-def tov_rhs_jit(
-    h,
-    y,
-    log_h,
-    log_p,
-    log_e,
-    log_dedp,
-    even_il,
-    odd_il,
-    even_ell,
-    odd_ell,
-    has_even,
-    has_odd,
-    i_r,
-    i_m,
-    i_nu,
-):
-    n = y.shape[0]
-    dy = np.empty(n)
-
-    # EOS interpolation (log-log)
-    p = _interp_positive(h, log_h, log_p)
-    e = _interp_positive(h, log_h, log_e)
-    dedp = _interp_positive(p, log_p, log_dedp)
-
-    # Basic TOV variables
-    r = y[i_r]
-    m = y[i_m]
-
-    r2 = r * r
-    r3 = r * r2
-    denom = m + 4.0 * pi * r3 * p
-
-    dr_dh = -r * (r - 2.0 * m) / denom
-    dm_dh = 4.0 * pi * r2 * e * dr_dh
-    dnu_dr = 2.0 * denom / (r * (r - 2.0 * m))
-
-    dy[i_r] = dr_dh
-    dy[i_m] = dm_dh
-    dy[i_nu] = dnu_dr * dr_dh
-
-    # Even perturbations
-    if has_even:
-        div_r = 1.0 / r
-        div_r2 = div_r * div_r
-        exp_lam = 1.0 / (1.0 - 2.0 * m * div_r)
-
-        dnu2 = dnu_dr * dnu_dr
-        C1 = 2.0 * div_r + exp_lam * (2.0 * m * div_r2 + 4.0 * pi * r * (p - e))
-
-        for k in range(even_ell.shape[0]):
-            ell = even_ell[k]
-            iH = even_il[2 * k]
-            idH = even_il[2 * k + 1]
-
-            Lam = ell * (ell + 1)
-
-            C0 = -dnu2
-            C0 += exp_lam * (
-                -Lam * div_r2 + 4.0 * pi * (5.0 * e + 9.0 * p + (e + p) * dedp)
-            )
-
-            H = y[iH]
-            dH = y[idH]
-
-            dy[iH] = dH * dr_dh
-            dy[idH] = -(C0 * H + C1 * dH) * dr_dh
-
-    # Odd perturbations
-    if has_odd:
-        div_r = 1.0 / r
-        div_r2 = div_r * div_r
-        div_r3 = div_r * div_r2
-        exp_lam = 1.0 / (1.0 - 2.0 * m * div_r)
-
-        C1 = exp_lam * (2.0 * m + 4.0 * pi * r3 * (p - e)) * div_r2
-
-        for k in range(odd_ell.shape[0]):
-            ell = odd_ell[k]
-            iPsi = odd_il[2 * k]
-            idPsi = odd_il[2 * k + 1]
-
-            Lam = ell * (ell + 1)
-
-            C0 = exp_lam * (-Lam * div_r2 + 6.0 * m * div_r3 - 4.0 * pi * (e - p))
-
-            Psi = y[iPsi]
-            dPsi = y[idPsi]
-
-            dy[iPsi] = dPsi * dr_dh
-            dy[idPsi] = -(C0 * Psi + C1 * dPsi) * dr_dh
-
-    return dy
 
 
 @_njit(cache=True)
 def _interp_positive(val, x_table, y_table):
     """
-    Linear interpolation in log-log space on a strictly positive,
-    monotonically increasing x_table.
-    Both val and all table entries must be > 0.
+    Log-log linear interpolation on a strictly positive, monotonically
+    increasing *x_table* (stored as log values).  Both *val* and all table
+    entries must be > 0.
     """
     lv = np.log(val)
-    # binary search
     lo, hi = 0, len(x_table) - 1
     while hi - lo > 1:
         mid = (lo + hi) >> 1
@@ -171,34 +55,86 @@ def _interp_positive(val, x_table, y_table):
     t = (lv - x_table[lo]) / (x_table[hi] - x_table[lo])
     return np.exp(y_table[lo] + t * (y_table[hi] - y_table[lo]))
 
-
 class TOV(object):
-    """
-    Class to solve the Tolman-Oppenheimer-Volkov stellar structure
-    equations together with even/odd parity stationary bartropic perturbations
+    
+    """Class to solve the Tolman-Oppenheimer-Volkov stellar structure
+    equations together with even/odd parity stationary bartropic perturbations.
 
-    Lindblom , Astrophys. J. 398 569. (1992)
+    References
+    ----------
+    Lindblom, Astrophys. J. 398, 569 (1992)
     Damour & Nagar, Phys. Rev. D 80, 084035 (2009)
 
-    Work in geometric units
+    Works in geometric units.
 
     Reference codes:
+
     * https://lscsoft.docs.ligo.org/lalsuite/lalsimulation/_l_a_l_sim_neutron_star_t_o_v_8c_source.html
     * https://bitbucket.org/bernuzzi/tov/src/master/TOVL.m
     * https://lscsoft.docs.ligo.org/bilby/_modules/bilby/gw/eos/tov_solver.html
 
+    Parameters
+    ----------
+    eos : EOS
+        Equation of state instance.
+    leven : list of int
+        Multipole indices for even-parity perturbations (Love numbers k, h).
+        Values must be > 1; values <= 1 are silently dropped.
+    lodd : list of int
+        Multipole indices for odd-parity perturbations (Love numbers j).
+        Values must be > 1; values <= 1 are silently dropped.
+    dhfact : float
+        Initial ODE step factor (must be negative, default ``-1e-12``).
+    ode_method : str
+        Integration method forwarded to ``ScipySolver`` / ``solve_ivp``
+        (e.g. ``'DOP853'``, ``'RK45'``).  Ignored for ``'numba'`` and
+        ``'jax'`` backends.
+    ode_atol : float
+        Absolute ODE tolerance (default ``1e-6``).
+    ode_rtol : float
+        Relative ODE tolerance (default ``1e-6``).
+    ode_backend : str or ODESolver
+        ODE solver backend.  Accepts:
+
+        * ``'scipy'`` (default) — wraps :func:`scipy.integrate.solve_ivp`;
+          ``ode_method`` selects the algorithm.
+        * ``'numba'`` — pure-NumPy adaptive Dormand-Prince RK45; independent
+          of scipy; structured for future Numba JIT once the EOS layer is
+          numba-compatible.
+        * ``'jax'`` — JAX/diffrax Dopri5 with a fully XLA-JIT-compiled native
+          RHS; ~3× faster than scipy after one-time JIT compilation warmup;
+          requires ``pip install "jax[cpu]" diffrax``.
+        * A pre-instantiated :class:`~tovpy.solvers.ODESolver` instance
+          (e.g. ``make_solver('scipy', method='RK45')``).
+
+    Examples
+    --------
+    Basic usage (default scipy backend)::
+
+        tov = TOV(eos=eos)
+        M, R, C = tov.solve(pc)
+
+    With tidal parameters::
+
+        tov = TOV(eos=eos, leven=[2], lodd=[2])
+        M, R, C, k, h, j = tov.solve(pc)
+
+    Alternative backends::
+
+        tov_numba = TOV(eos=eos, ode_backend='numba')
+        tov_jax   = TOV(eos=eos, ode_backend='jax')
+        tov_rk45  = TOV(eos=eos, ode_backend=make_solver('scipy', method='RK45'))
     """
 
-    def __init__(
-        self,
-        eos=None,  # EOS instance
-        leven=[],  # multipole indexes of even perturbations
-        lodd=[],  # multipole indexes of odd perturbations
-        dhfact=-1e-12,  # ODE step
-        ode_method="DOP853",
-        ode_atol=1e-9,
-        ode_rtol=1e-9,
-    ):
+    def __init__(self,
+                 eos        = None,
+                 leven      = [],
+                 lodd       = [],
+                 dhfact     = -1e-12,
+                 ode_method = 'DOP853',
+                 ode_atol   = 1e-6,
+                 ode_rtol   = 1e-6,
+                 ode_backend = 'scipy'):
 
         if not eos:
             raise ValueError("Must provide a EOS")
@@ -207,54 +143,48 @@ class TOV(object):
         leven = np.array(leven)
         lodd = np.array(lodd)
 
-        # Solve perturbation equations for these indexes
-        self.leven = leven[leven > 1]
-        self.lodd = lodd[lodd > 1]
+        self.leven = leven[leven>1]
+        self.lodd  = lodd[lodd>1]
 
-        # Build variable list
         var = self.__buildvars()
         self.nvar = len(var)
         self.var = dict(zip(var, range(self.nvar)))
         self.ivar = {v: k for k, v in self.var.items()}
 
-        # ------------------------------------------------------------------
-        # SPEED: cache integer indices once so the RHS never does dict lookups
-        # ------------------------------------------------------------------
-        self._i_r = self.var["r"]
-        self._i_m = self.var["m"]
-        self._i_nu = self.var["nu"]
-
-        # Per-perturbation index pairs: [(i_H, i_dH), ...] and [(i_Psi, i_dPsi), ...]
-        self._even_idx = [
-            (self.var["H{}".format(l)], self.var["dH{}".format(l)]) for l in self.leven
-        ]
-        self._odd_idx = [
-            (self.var["Psi{}".format(l)], self.var["dPsi{}".format(l)])
-            for l in self.lodd
-        ]
-
-        # int64 arrays of ell values needed by the JIT RHS
-        self._even_ells = np.array(self.leven, dtype=np.int64)
-        self._odd_ells = np.array(self.lodd, dtype=np.int64)
-
-        # ODE solver options
-        if dhfact > 0.0:
+        if dhfact > 0.:
             raise ValueError("ODE timestep must be negative")
         self.dhfact = dhfact
         self.ode_method = ode_method
         self.ode_atol = ode_atol
         self.ode_rtol = ode_rtol
 
-        # Pre-build EOS tables for JIT interpolation (done once at construction)
+        if ode_backend == 'scipy':
+            self.solver = make_solver('scipy', method=ode_method)
+        else:
+            self.solver = make_solver(ode_backend)
+
+        self._i_r   = self.var['r']
+        self._i_m   = self.var['m']
+        self._i_nu  = self.var['nu']
+        self._even_idx = [
+            (self.var['H{}'.format(l)], self.var['dH{}'.format(l)])
+            for l in self.leven
+        ]
+        self._odd_idx = [
+            (self.var['Psi{}'.format(l)], self.var['dPsi{}'.format(l)])
+            for l in self.lodd
+        ]
+
         self._build_eos_tables()
 
-        if _NUMBA_AVAILABLE:
-            # JIT the RHS with pre-built tables and cached indices
-            self.__tov_rhs = tov_rhs_jit
-        else:
-            # Python fallback (slower, but no Numba dependency)
-            self.__tov_rhs = self.__tov_rhs_base
+        self._update_even = (
+            self._apply_even_perts if len(self.leven) else lambda dy, y, m, r, p, e, dedp, dr_dh, dnu_dr: None
+        )
+        self._update_odd = (
+            self._apply_odd_perts if len(self.lodd) else lambda dy, y, m, r, p, e, dedp, dr_dh: None
+        )
 
+        
     def __buildvars(self):
         """
         List of varnames
@@ -269,93 +199,178 @@ class TOV(object):
         return v
 
     def _build_eos_tables(self, n_points=2000):
-        """
-        Pre-sample the EOS once at construction and store log-space arrays
-        for use in the Numba JIT RHS.
+        """Pre-sample the EOS once at construction and store log-space 1-D arrays
+        for use in the fast RHS interpolation path.
 
-        Key fix: h is POSITIVE inside the star (the integrator runs from
-        h0 > 0 down to h ~ 0).  We therefore interpolate on h directly
-        (not on -h), storing log(h) as the independent variable so that
-        _interp_positive can do a standard log-log binary search.
+        Tables stored (all 1-D, contiguous, float64):
+          _log_h        : log(h) values (sorted ascending)
+          _log_p        : log(p) values (same ordering as h)
+          _log_e        : log(e) values
+          _log_p_sorted : log(p) sorted ascending (key for dedp lookup)
+          _log_dedp     : log(dedp) values, sorted by ascending log(p)
 
-        Tables stored:
-          _lh_lp  : log(h) -> log(p)     shape (n,2)
-          _lh_le  : log(h) -> log(e)     shape (n,2)
-          _lp_ldedp : log(p) -> log(dedp) shape (n,2)
+        Also binds ``self._eos_eval(h) -> (p, e, dedp)`` once, choosing the
+        Numba JIT path or the ``np.interp`` path depending on availability.
         """
-        # Sample pressure from just above the minimum h the EOS supports.
-        # We use the EOS's own central-value range by probing a wide span
-        # of pressures and keeping only the physically valid portion.
         try:
             p_min = float(self.eos.p_min) * 1.001
             p_max = float(self.eos.p_max) * 0.999
         except AttributeError:
-            # Fallback: walk inward from a very small pressure until the
-            # EOS returns a positive pseudo-enthalpy.
             p_min = 1e-19
             p_max = 1e-8
 
-        p_arr = np.logspace(np.log10(p_min), np.log10(p_max), n_points)
-
-        # Evaluate EOS; drop any points where h <= 0 (unphysical / below surface)
-        h_arr = np.array([self.eos.PseudoEnthalpy_Of_Pressure(p) for p in p_arr])
-        e_arr = np.array([self.eos.EnergyDensity_Of_Pressure(p) for p in p_arr])
+        p_arr    = np.logspace(np.log10(p_min), np.log10(p_max), n_points)
+        h_arr    = np.array([self.eos.PseudoEnthalpy_Of_Pressure(p) for p in p_arr])
+        e_arr    = np.array([self.eos.EnergyDensity_Of_Pressure(p)  for p in p_arr])
         dedp_arr = np.array([self.eos.EnergyDensityDeriv_Of_Pressure(p) for p in p_arr])
 
         valid = (h_arr > 0) & (e_arr > 0) & (dedp_arr > 0) & (p_arr > 0)
-        h_arr = h_arr[valid]
-        p_arr = p_arr[valid]
-        e_arr = e_arr[valid]
-        dedp_arr = dedp_arr[valid]
+        h_arr    = h_arr[valid];    p_arr    = p_arr[valid]
+        e_arr    = e_arr[valid];    dedp_arr = dedp_arr[valid]
 
-        # Sort by ascending h (needed for binary search)
-        idx = np.argsort(h_arr)
-        h_arr = h_arr[idx]
-        p_arr = p_arr[idx]
-        e_arr = e_arr[idx]
-        dedp_arr = dedp_arr[idx]
+        idx   = np.argsort(h_arr)
+        h_arr = h_arr[idx];  p_arr = p_arr[idx]
+        e_arr = e_arr[idx];  dedp_arr = dedp_arr[idx]
 
-        # Contiguous 1D log-space arrays — no slice allocation on every RHS call
-        self._log_h = np.ascontiguousarray(np.log(h_arr))
-        self._log_p = np.ascontiguousarray(np.log(p_arr))
-        self._log_e = np.ascontiguousarray(np.log(e_arr))
-        self._log_dedp = np.ascontiguousarray(np.log(dedp_arr))
-        self._log_p_s = self._log_p  # p sorted ascending, reused as dedp key
+        self._log_h    = np.ascontiguousarray(np.log(h_arr))
+        self._log_p    = np.ascontiguousarray(np.log(p_arr))
+        self._log_e    = np.ascontiguousarray(np.log(e_arr))
 
-        # Flat int64 index arrays for JIT RHS
-        if len(self.leven):
-            ev = []
-            for iH, idH in self._even_idx:
-                ev += [iH, idH]
-            self._even_il = np.array(ev, dtype=np.int64)
+        # dedp keyed by pressure
+        p_idx = np.argsort(p_arr)
+        self._log_p_sorted = np.ascontiguousarray(np.log(p_arr[p_idx]))
+        self._log_dedp     = np.ascontiguousarray(np.log(dedp_arr[p_idx]))
+
+        log_h = self._log_h;  log_p = self._log_p;  log_e = self._log_e
+        log_p_sorted = self._log_p_sorted;  log_dedp = self._log_dedp
+
+        if _NUMBA_AVAILABLE:
+            def _eos_eval(h):
+                p    = _interp_positive(h, log_h, log_p)
+                e    = _interp_positive(h, log_h, log_e)
+                dedp = _interp_positive(p, log_p_sorted, log_dedp)
+                return p, e, dedp
         else:
-            self._even_il = np.empty(0, dtype=np.int64)
-        if len(self.lodd):
-            ov = []
-            for iP, idP in self._odd_idx:
-                ov += [iP, idP]
-            self._odd_il = np.array(ov, dtype=np.int64)
-        else:
-            self._odd_il = np.empty(0, dtype=np.int64)
-        self._even_ell_arr = np.array(self.leven, dtype=np.int64)
-        self._odd_ell_arr = np.array(self.lodd, dtype=np.int64)
+            def _eos_eval(h):
+                lh   = np.log(h)
+                p    = np.exp(np.interp(lh, log_h, log_p))
+                e    = np.exp(np.interp(lh, log_h, log_e))
+                dedp = np.exp(np.interp(np.log(p), log_p_sorted, log_dedp))
+                return p, e, dedp
 
-        # Backward-compat aliases for the Python RHS path
-        self._lh_lp = np.column_stack([self._log_h, self._log_p])
-        self._lh_le = np.column_stack([self._log_h, self._log_e])
-        self._lp_ldedp = np.column_stack([self._log_p, self._log_dedp])
+        self._eos_eval = _eos_eval
 
-    def __pert_even(self, ell, m, r, p, e, dedp, dnu_dr=[]):
+    def _get_jax_rhs(self):
+        """Return a native JAX RHS, building and caching it on first call.
+
+        Returns ``None`` if JAX is not installed.  The returned function has a
+        stable Python identity, which allows diffrax to cache its JIT-compiled
+        integration across multiple :meth:`solve` calls.
+        """
+        if not hasattr(self, '_jax_rhs_cached'):
+            self._jax_rhs_cached = self._build_jax_rhs()
+        return self._jax_rhs_cached
+
+    def _build_jax_rhs(self):
+        """Build a native JAX / XLA RHS using ``jnp`` operations throughout.
+
+        The returned callable ``jax_rhs(h, y) -> jnp.ndarray`` mirrors
+        :meth:`__tov_rhs` but replaces all NumPy operations with their JAX
+        equivalents so that diffrax can JIT-compile the entire integration loop
+        in a single XLA kernel.
+
+        * EOS interpolation uses ``jnp.interp`` on the pre-built log-tables.
+        * Perturbation loops are *statically unrolled* at Python level (compile-
+          time constants) — JAX sees no Python control flow.
+        * Array updates use ``dy.at[i].set(v)`` (JAX immutable semantics).
+
+        Returns ``None`` if JAX is not installed.
+        """
+        try:
+            import jax
+            import jax.numpy as jnp
+        except ImportError:
+            return None
+
+        jax.config.update("jax_enable_x64", True)
+
+        log_h        = jnp.array(self._log_h)
+        log_p        = jnp.array(self._log_p)
+        log_e        = jnp.array(self._log_e)
+        log_p_sorted = jnp.array(self._log_p_sorted)
+        log_dedp_jax = jnp.array(self._log_dedp)
+
+        i_r, i_m, i_nu = self._i_r, self._i_m, self._i_nu
+        nvar      = self.nvar
+        even_idx  = list(self._even_idx)
+        leven_l   = list(self.leven)
+        odd_idx   = list(self._odd_idx)
+        lodd_l    = list(self.lodd)
+        pi        = float(np.pi)
+
+        def eos_eval_jax(h):
+            lh   = jnp.log(h)
+            p    = jnp.exp(jnp.interp(lh, log_h, log_p))
+            e    = jnp.exp(jnp.interp(lh, log_h, log_e))
+            dedp = jnp.exp(jnp.interp(jnp.log(p), log_p_sorted, log_dedp_jax))
+            return p, e, dedp
+
+        def jax_rhs(h, y):
+            r = y[i_r]
+            m = y[i_m]
+            p, e, dedp = eos_eval_jax(h)
+            dr_dh  = -r * (r - 2.0 * m) / (m + 4.0 * pi * r**3 * p)
+            dm_dh  =  4.0 * pi * r**2 * e * dr_dh
+            dnu_dr =  2.0 * (m + 4.0 * pi * r**3 * p) / (r * (r - 2.0 * m))
+            dy = jnp.zeros(nvar, dtype=jnp.float64)
+            dy = dy.at[i_r].set(dr_dh)
+            dy = dy.at[i_m].set(dm_dh)
+            dy = dy.at[i_nu].set(dnu_dr * dr_dh)
+
+            # Even perturbations (Python loop unrolled at JAX trace time)
+            for l_val, (iH, idH) in zip(leven_l, even_idx):
+                Lam     = float(l_val * (l_val + 1))
+                div_r   = 1.0 / r
+                div_r2  = div_r ** 2
+                exp_lam = 1.0 / (1.0 - 2.0 * m * div_r)
+                C1_e = 2.0/r + exp_lam * (2.0*m*div_r2 + 4.0*pi*r*(p - e))
+                C0_e = -(dnu_dr**2) + exp_lam * (
+                    -Lam*div_r2 + 4.0*pi*(5.0*e + 9.0*p + (e + p)*dedp))
+                H  = y[iH]
+                dH = y[idH]
+                dy = dy.at[iH].set(dH * dr_dh)
+                dy = dy.at[idH].set(-(C0_e * H + C1_e * dH) * dr_dh)
+
+            # Odd perturbations (Python loop unrolled at JAX trace time)
+            for l_val, (iPsi, idPsi) in zip(lodd_l, odd_idx):
+                Lam     = float(l_val * (l_val + 1))
+                div_r   = 1.0 / r
+                div_r2  = div_r ** 2
+                div_r3  = div_r * div_r2
+                r3      = r * r * r
+                exp_lam = 1.0 / (1.0 - 2.0 * m * div_r)
+                C1_o = exp_lam * (2.0*m + 4.0*pi*r3*(p - e)) * div_r2
+                C0_o = exp_lam * (-Lam*div_r2 + 6.0*m*div_r3 - 4.0*pi*(e - p))
+                Psi  = y[iPsi]
+                dPsi = y[idPsi]
+                dy = dy.at[iPsi].set(dPsi * dr_dh)
+                dy = dy.at[idPsi].set(-(C0_o * Psi + C1_o * dPsi) * dr_dh)
+
+            return dy
+
+        return jax_rhs
+
+    def __pert_even(self,ell,m,r,p,e,dedp,dnu_dr=[]):
         """
         Eq.(27-29) of Damour & Nagar, Phys. Rev. D 80, 084035 (2009)
         https://arxiv.org/abs/0906.0096
         Note only C0 depends on ell: return an array of values
         """
-        r2 = r**2
-        r3 = r * r2
-        div_r = 1.0 / r
-        div_r2 = div_r**2
-        exp_lam = 1.0 / (1.0 - 2.0 * m * div_r)  # Eq. (18)
+        r2       = r**2
+        r3       = r * r2
+        div_r    = 1.0/r
+        div_r2   = div_r**2
+        exp_lam  = 1.0 / (1.0 - 2.0 * m * div_r )
         if not dnu_dr:
             dnu2 = (2.0 * (m + 4.0 * np.pi * r3 * p) / (r * (r - 2.0 * m))) ** 2
         else:
@@ -380,87 +395,61 @@ class TOV(object):
         r3 = r * r2
         div_r = 1.0 / r
         div_r2 = div_r**2
-        div_r3 = div_r * div_r2
-        exp_lam = 1.0 / (1.0 - 2.0 * m * div_r)  # Eq. (18)
-        C1 = exp_lam * (2 * m + 4 * np.pi * r3 * (p - e)) * div_r2
-        C0 = np.zeros(max(ell) + 1)
+        div_r3 = div_r*div_r2
+        exp_lam = 1.0 / (1.0 - 2.0 * m * div_r )
+        C1 = exp_lam * ( 2*m + 4*np.pi*r3*(p-e) ) * div_r2
+        C0 = np.zeros(max(ell)+1)
         for l in ell:
             Lam = l * (l + 1)
             C0[l] = exp_lam * (-Lam * div_r2 + 6 * m * div_r3 - 4 * np.pi * (e - p))
         return C1, C0
 
-    def __tov_rhs_base(self, h, y):
-        """
-        ODE r.h.s. for TOV equations with pseudo-enthalpy independent variable.
-        Implements Eqs. (5) and (6) of Lindblom, Astrophys. J. 398, 569 (1992).
-        Also uses Eqs. (7) and (8) [ibid] for inner boundary data, and
-        Eqs. (18), (27), (28) of Damour & Nagar, Phys. Rev. D 80, 084035 (2009)
-        for the metric perturbation used to obtain the Love number.
+    def _apply_even_perts(self, dy, y, m, r, p, e, dedp, dr_dh, dnu_dr):
+        """Apply even-parity perturbation equations to derivative vector *dy*."""
+        C1, C0 = self.__pert_even(self.leven, m, r, p, e, dedp, dnu_dr)
+        for l, (iH, idH) in zip(self.leven, self._even_idx):
+            H  = y[iH]
+            dH = y[idH]
+            dy[iH]  = dH * dr_dh
+            dy[idH] = -(C0[l] * H + C1 * dH) * dr_dh
 
-        SPEED: uses cached integer indices (_i_r, _i_m, _i_nu, _even_idx,
-               _odd_idx) instead of dict lookups on every call.
-               When Numba is available, EOS lookups use pre-built log tables
-               instead of calling through Python.
+    def _apply_odd_perts(self, dy, y, m, r, p, e, dedp, dr_dh):
+        """Apply odd-parity perturbation equations to derivative vector *dy*."""
+        C1, C0 = self.__pert_odd(self.lodd, m, r, p, e, dedp)
+        for l, (iPsi, idPsi) in zip(self.lodd, self._odd_idx):
+            Psi  = y[iPsi]
+            dPsi = y[idPsi]
+            dy[iPsi]  = dPsi * dr_dh
+            dy[idPsi] = -(C0[l] * Psi + C1 * dPsi) * dr_dh
+
+    def __tov_rhs(self, h, y):
+        """ODE r.h.s. for TOV equations with pseudo-enthalpy independent variable.
+
+        Implements Eqs. (5) and (6) of Lindblom, Astrophys. J. 398, 569 (1992),
+        and Eqs. (18), (27), (28) of Damour & Nagar, Phys. Rev. D 80, 084035 (2009).
         """
         dy = np.zeros_like(y)
-
-        # SPEED: integer index, not dict lookup
         r = y[self._i_r]
         m = y[self._i_m]
-
-        # EOS calls
-        if _NUMBA_AVAILABLE:
-            # h is positive; interpolate directly on log(h)
-            p = _interp_positive(h, self._lh_lp[:, 0], self._lh_lp[:, 1])
-            e = _interp_positive(h, self._lh_le[:, 0], self._lh_le[:, 1])
-            dedp = _interp_positive(p, self._lp_ldedp[:, 0], self._lp_ldedp[:, 1])
-        else:
-            p = self.eos.Pressure_Of_PseudoEnthalpy(h)
-            e = self.eos.EnergyDensity_Of_PseudoEnthalpy(h)
-            dedp = self.eos.EnergyDensityDeriv_Of_Pressure(p)
-
-        # TOV
-        dr_dh = -r * (r - 2.0 * m) / (m + 4.0 * np.pi * r**3 * p)
-        dm_dh = 4.0 * np.pi * r**2 * e * dr_dh
-        dnu_dr = 2.0 * (m + 4.0 * np.pi * r**3 * p) / (r * (r - 2.0 * m))
-
-        # SPEED: integer index, not dict lookup
-        dy[self._i_r] = dr_dh
-        dy[self._i_m] = dm_dh
+        p, e, dedp = self._eos_eval(h)
+        dr_dh  = -r * (r - 2.0 * m) / (m + 4.0 * np.pi * r**3 * p)
+        dm_dh  =  4.0 * np.pi * r**2 * e * dr_dh
+        dnu_dr =  2.0 * (m + 4.0 * np.pi * r**3 * p) / (r * (r - 2.0 * m))
+        dy[self._i_r]  = dr_dh
+        dy[self._i_m]  = dm_dh
         dy[self._i_nu] = dnu_dr * dr_dh
-
-        # Even perturbations
-        if len(self.leven) != 0:
-            C1, C0 = self.__pert_even(self.leven, m, r, p, e, dedp, dnu_dr)
-            # SPEED: pre-cached index pairs, no per-step string formatting
-            for l, (iH, idH) in zip(self.leven, self._even_idx):
-                H = y[iH]
-                dH = y[idH]
-                dy[iH] = dH * dr_dh
-                dy[idH] = -(C0[l] * H + C1 * dH) * dr_dh
-
-        # Odd perturbations
-        if len(self.lodd) != 0:
-            C1, C0 = self.__pert_odd(self.lodd, m, r, p, e, dedp)
-            # SPEED: pre-cached index pairs, no per-step string formatting
-            for l, (iPsi, idPsi) in zip(self.lodd, self._odd_idx):
-                Psi = y[iPsi]
-                dPsi = y[idPsi]
-                dy[iPsi] = dPsi * dr_dh
-                dy[idPsi] = -(C0[l] * Psi + C1 * dPsi) * dr_dh
-
+        self._update_even(dy, y, m, r, p, e, dedp, dr_dh, dnu_dr)
+        self._update_odd(dy, y, m, r, p, e, dedp, dr_dh)
         return dy
 
-    def __initial_data(self, pc, dh_fact=-1e-12, verbose=False):
-        """
-        Set initial data for the solution of TOV equations using the pseudo-enthalpy formalism introduced in:
-        Lindblom (1992) "Determining the Nuclear Equation of State from Neutron-Star Masses and Radii", Astrophys. J. 398 569.
-        * input the central pressure
+    def __initial_data(self, pc, dh_fact=-1e-12):
+        """Set initial data for the TOV ODE using the pseudo-enthalpy formalism.
+
+        Lindblom (1992), Astrophys. J. 398, 569 — Eqs. (7) and (8).
         """
         y = np.zeros(self.nvar)
-        # Central values
-        ec = self.eos.EnergyDensity_Of_Pressure(pc)
-        hc = self.eos.PseudoEnthalpy_Of_Pressure(pc)
+        ec     = self.eos.EnergyDensity_Of_Pressure(pc)
+        hc     = self.eos.PseudoEnthalpy_Of_Pressure(pc)
         dedp_c = self.eos.EnergyDensityDeriv_Of_Pressure(pc)
         dhdp_c = 1.0 / (ec + pc)
         dedh_c = dedp_c / dhdp_c
@@ -469,79 +458,61 @@ class TOV(object):
         h1 = 0.0 - dh
         r0 = np.sqrt(-3.0 * dh / (2.0 * np.pi * (ec + 3.0 * pc)))
         m0 = 4.0 * np.pi * r0**3 * ec / 3.0
-        # Series expansion for the initial core
-        r0 *= 1.0 + 0.25 * dh * (ec - 3.0 * pc - 0.6 * dedh_c) / (
-            ec + 3.0 * pc
-        )  # second factor Eq. (7) of Lindblom (1992)
-        m0 *= (
-            1.0 + 0.6 * dh * dedh_c / ec
-        )  # second factor of Eq. (8) of Lindblom (1992)
-
-        # SPEED: integer indices
-        y[self._i_r] = r0
-        y[self._i_m] = m0
+        r0 *= 1.0 + 0.25 * dh * (ec - 3.0 * pc  - 0.6 * dedh_c) / (ec + 3.0 * pc)
+        m0 *= 1.0 + 0.6 * dh * dedh_c / ec
+        y[self._i_r]  = r0
+        y[self._i_m]  = m0
         y[self._i_nu] = 0.0
-
-        #  Initial data for the ell-perturbation
         a0 = 1.0
-        if len(self.leven) != 0:
+        if len(self.leven):
             for l, (iH, idH) in zip(self.leven, self._even_idx):
-                y[iH] = a0 * r0**l
-                y[idH] = a0 * l * r0 ** (l - 1)
-        if len(self.lodd) != 0:
+                y[iH]  = a0 * r0**l
+                y[idH] = a0 * l * r0**(l-1)
+        if len(self.lodd):
             for l, (iPsi, idPsi) in zip(self.lodd, self._odd_idx):
-                y[iPsi] = a0 * r0 ** (l + 1)
-                y[idPsi] = a0 * (l + 1) * r0**l
+                y[iPsi]  = a0 * r0**(l+1)
+                y[idPsi] = a0 * (l+1) * r0**l
         return y, h0, h1
 
     def solve(self, pc):
+        """Solve the TOV equations for a given central pressure *pc*.
+
+        Lindblom (1992), Astrophys. J. 398, 569.
         """
-        Solves the Tolman-Oppenheimer-Volkov stellar structure equations using the pseudo-enthalpy formalism introduced in:
-        Lindblom (1992) "Determining the Nuclear Equation of State from Neutron-Star Masses and Radii", Astrophys. J. 398 569.
-        """
-        # Initial data
-        y, h0, h1 = self.__initial_data(pc, dh_fact=self.dhfact, verbose=True)
-        # Fallback: standard scipy solve_ivp
-        sol = solve_ivp(
-            self.__tov_rhs,
-            [h0, h1],
-            y,
-            first_step=abs(self.dhfact),
-            method=self.ode_method,
-            rtol=self.ode_rtol,
-            atol=self.ode_atol,
-        )
-        # Take one final Euler step to get to surface
-        y = sol.y[:, -1]
-        dy = self.__tov_rhs(sol.t[-1], y)
+        y, h0, h1 = self.__initial_data(pc, dh_fact=self.dhfact)
+        sol = self.solver.solve(self.__tov_rhs, [h0, h1], y,
+                        first_step = abs(self.dhfact),
+                        rtol = self.ode_rtol,
+                        atol = self.ode_atol)
+
+        # Final Euler step to the surface
+        y  = sol.y[:,-1]
+        dy = self.__tov_rhs(sol.t[-1],y)
         y[:] -= dy[:] * h1
         np.append(sol.y, y)
-        # Mass, Radius & Compactness
         M, R, C = self.__compute_mass_radius(y)
         # Match to Schwarzschild exterior
-        sol.y[self._i_nu, :] += np.log(1.0 - (2.0 * M) / R) - sol.y[self._i_nu, -1]
-        if _NUMBA_AVAILABLE:
-            sol.y[:, 1] = y  # update stub with corrected final state
+        sol.y[self._i_nu, :] += np.log(1.0-(2.*M)/R) - sol.y[self._i_nu, -1]
 
         self.sol = sol
-        if len(self.leven) != 0:
+        if len(self.leven):
             k, h = {}, {}
             for l, (iH, idH) in zip(self.leven, self._even_idx):
                 yyl = R * y[idH] / y[iH]
-                k[l] = self.__compute_Love_even(l, C, yyl)
-                h[l] = self.__compute_shape(l, C, yyl)
-        if len(self.lodd) != 0:
+                k[l] = self.__compute_Love_even(l,C,yyl)
+                h[l] = self.__compute_shape(l,C,yyl)
+        if len(self.lodd):
             j = {}
             for l, (iPsi, idPsi) in zip(self.lodd, self._odd_idx):
                 yyl = R * y[idPsi] / y[iPsi]
-                j[l] = self.__compute_Love_odd(l, C, yyl)
+                j[l] = self.__compute_Love_odd(l,C,yyl)
 
-        if len(self.leven) != 0 and len(self.lodd) != 0:
-            return M, R, C, k, h, j
-        elif len(self.leven) != 0 and len(self.lodd) == 0:
-            return M, R, C, k, h
-        elif len(self.leven) == 0 and len(self.lodd) != 0:
-            return M, R, C, j
+        if len(self.leven) and len(self.lodd):
+            return M,R,C,k,h,j
+        elif len(self.leven) and not len(self.lodd):
+            return M,R,C,k,h
+        elif not len(self.leven) and len(self.lodd):
+            return M,R,C,j
         else:
             return M, R, C
 
@@ -684,36 +655,29 @@ class TOV(object):
         """
         Compute mass, radius, & compactness
         """
-        # SPEED: integer indices
         R = y[self._i_r]
         M = y[self._i_m]
-        return M, R, M / R
+        return M,R,M/R
 
     def Compute_baryon_mass(self, sol):
         """
         Compute baryon mass
         """
-        # SPEED: integer indices
         r = sol.y[self._i_r, :]
         m = sol.y[self._i_m, :]
-        e = np.array(
-            [
-                self.eos.EnergyDensity_Of_PseudoEnthalpy(sol.t[i])
-                for i in range(len(sol.t))
-            ]
-        )
-        return np.trapz(4 * np.pi * r**2.0 * e / np.sqrt(1 - 2 * m / r), r)
+        # e = self.EOSEnergyDensityOfPseudoEnthalpyGeometerized(sol.t,self.eos)
+        e = np.array([self.eos.EnergyDensity_Of_PseudoEnthalpy(sol.t[i]) for i in range(len(sol.t))])
+        return np.trapz( 4*np.pi*r**2.*e/np.sqrt(1-2*m/r), r )
 
     def Compute_proper_radius(self, sol):
         """
         Compute proper radius
         """
-        # SPEED: integer indices
         r = sol.y[self._i_r, :]
         m = sol.y[self._i_m, :]
-        return np.trapz(r, 1.0 / np.sqrt((1 - 2 * m / r)), r)
-
-    def __compute_Love_odd(self, ell, c, y):
+        return np.trapz( r, 1./np.sqrt((1-2*m/r)), r )
+        
+    def __compute_Love_odd(self,ell,c,y):
         """
         Compute odd parity Love numbers given
         * the multipolar index ell
@@ -727,21 +691,9 @@ class TOV(object):
         c5 = c * c4
         j = 0.0
         if ell == 2:
-            nj = 96 * c5 * (-1 + 2 * c) * (-3 + y)
-            dj = 5.0 * (
-                2
-                * c
-                * (
-                    9
-                    + 3 * c * (-3 + y)
-                    + 2 * c2 * (-3 + y)
-                    + 2 * c3 * (-3 + y)
-                    - 3 * y
-                    + 12 * c4 * (1 + y)
-                )
-                + 3 * (-1 + 2 * c) * (-3 + y) * log(1 - 2 * c)
-            )
-            j = nj / dj
+            nj =  96*c5*(-1 + 2*c)*(-3 + y)
+            dj =  5.*(2*c*(9 + 3*c*(-3 + y) + 2*c2*(-3 + y) + 2*c3*(-3 + y) - 3*y + 12*c4*(1 + y)) + 3*(-1 + 2*c)*(-3 + y)*np.log(1 - 2*c))
+            j = nj/dj
         else:
             PsiP, dPsiP, PsiQ, dPsiQ = self.__compute_psi(c, ell)
             factor = -(c ** (2 * ell + 1))
@@ -1058,7 +1010,6 @@ class TOV(object):
             )
             k = 256 / 2431 * c17 * nk / dk
         else:
-            # https://bitbucket.org/bernuzzi/tov/src/master/ComputeLegendre.m
             Pl2, dPl2, Ql2, dQl2 = self.__compute_legendre(c, ell)
             k = (
                 -1
@@ -1094,26 +1045,9 @@ class TOV(object):
         if ell < 2:
             return h
         if ell == 2:
-            nh = -2 + 6 * c + 2 * c3 * (1 + y) - c2 * (6 + y)
-            dh = 2 * c * (
-                6
-                + c2 * (26 - 22 * y)
-                - 3 * y
-                + 4 * c4 * (1 + y)
-                + 3 * c * (-8 + 5 * y)
-                + c3 * (-4 + 6 * y)
-            ) - 3 * (1 - 2 * c) ** 2 * (2 + 2 * c * (-1 + y) - y) * np.log(
-                1.0 / (1 - 2 * c)
-            )
-            h = -8 * c5 * nh / dh
-        # elif ell == 3:
-        #     nh = -5 + 15*c + 2*c3*(1 + y) - c2*(12 + y)
-        #     dh = (5.*(2*c*(15*(-3 + y) + 4*c5*(1 + y) - 45*c*(-5 + 2*y) - 20*c3*(-9 + 7*y) + 2*c4*(-2 + 9*y) + 5*c2*(-72 + 37*y)) - 15*(1 - 2*c)**2*(-3 - 3*c*(-2 + y) + 2*c2*(-1 + y) + y)*np.log(1.0/(1 - 2*c))))
-        #     h = 16*c7*nh/dh
-        # elif ell == 4:
-        #     nh = -9 + 27*c + 2*c3*(1 + y) - c2*(20 + y)
-        #     dh = (21.*(2*c*(c2*(5360 - 1910*y) + c4*(1284 - 996*y) - 105*(-4 + y) + 8*c6*(1 + y) + 105*c*(-24 + 7*y)  + 40*c3*(-116 + 55*y) + c5*(-8 + 68*y)) - 15*(1 - 2*c)**2*(-7*(-4 + y) + 28*c*(-3 + y) - 34*c2*(-2 + y) + 12*c3*(-1 + y))*np.log(1.0/(1 - 2*c))))
-        #     h = -64*c9*nh/dh
+            nh = (-2 + 6*c + 2*c3*(1 + y) - c2*(6 + y))
+            dh = (2*c*(6 + c2*(26 - 22*y) - 3*y + 4*c4*(1 + y) + 3*c*(-8 + 5*y) + c3*(-4 + 6*y)) - 3*(1 - 2*c)**2*(2 + 2*c*(-1 + y) - y)*np.log(1.0/(1 - 2*c)))
+            h = -8*c5*nh/dh
         else:
             Pl2, dPl2, Ql2, dQl2 = self.__compute_legendre(c, ell)
             term1 = (1 - 2 * c) / c

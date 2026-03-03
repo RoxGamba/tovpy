@@ -17,10 +17,6 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 import numpy as np
 from scipy.special import factorial2
-# try:
-#     from scipy import factorial2
-# except:  
-#     from scipy.misc import factorial2
 
 def q_of_nu(q):
     """
@@ -135,8 +131,7 @@ def Laml_to_kappal(q, LamAl, LamBl, ell):
     f2l1 = factorial2(2*ell-1)
     p = 2*ell + 1
     kappaAl = f2l1 * LamAl * XA**p / q
-    kappaBl = f2l1 * LamBl * XB**p * q 
-    #kappaTl = kappaAl + kappaBl;
+    kappaBl = f2l1 * LamBl * XB**p * q
     return  kappaAl, kappaBl
 
 def klC_to_Laml(C, kl, ell):
@@ -196,7 +191,6 @@ def Chang2014_fit_omgf(Lam,ell=2):
     """
     y = np.log(Lam)
     a = Chang2014_fitcoefs(ell)
-    #return (a[0] + a[1]*y + a[2]*y**2 + a[3]*y**3 + a[4]*y**4)
     return  np.polyval(a[::-1], y)
 
 

@@ -94,9 +94,6 @@ class Units(object):
         self.constant['G_C4_SI'] = (G_C4_SI, 'Geometrized pressure in Pa')
         self.constant['NUCL_DENSI_GEOM_SI'] = (NUCL_DENSI_GEOM_SI, 'Nuclear density in geometrized units of m^-2')
         
-        # Some conversion factors from geometrized to CGS or SI unit systems
-        #TODO check/fixme
-        
         self.conversion_factor = {
             'pressure': {'cgs': 1.0 / G_C4_SI * 10., 'si': 1.0 / G_C4_SI, 'geom': 1.0},
             'energy_density': {'cgs': 1.0 / G_C4_SI * 10., 'si': C_SI ** 4. / G_SI, 'geom': 1.},
@@ -185,11 +182,4 @@ class Units(object):
         'pressure', 'energy_density', 'density', 'pseudo_enthalpy', 'mass', 'radius', 'time'
         """
         return self.conversion_factor[k]['si'] / self.conversion_factor[k]['cgs']
-
-
-# if __name__ == "__main__":
-
-    
-#     uts = Units()
-#     uts.show()
 
