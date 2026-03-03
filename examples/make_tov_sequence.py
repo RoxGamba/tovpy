@@ -19,7 +19,7 @@ parser.add_argument(
     "--np", default=50, type=int, help="number of central pressure points"
 )
 parser.add_argument(
-    "--backend", default="scipy", choices=["scipy", "numba"],
+    "--backend", default="scipy", choices=["scipy", "numba", "jax"],
     help="ODE solver backend (default: scipy)"
 )
 parser.add_argument("-o", "--output", help="Output filename")

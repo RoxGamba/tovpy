@@ -67,21 +67,73 @@ def _interp_positive(val, x_table, y_table):
 
 class TOV(object):
     
-    """ 
+    """Class to solve the Tolman-Oppenheimer-Volkov stellar structure
+    equations together with even/odd parity stationary bartropic perturbations.
 
-    Class to solve the Tolman-Oppenheimer-Volkov stellar structure
-    equations together with even/odd parity stationary bartropic perturbations
-    
-    Lindblom , Astrophys. J. 398 569. (1992) 
+    References
+    ----------
+    Lindblom, Astrophys. J. 398, 569 (1992)
     Damour & Nagar, Phys. Rev. D 80, 084035 (2009)
-    
-    Work in geometric units
+
+    Works in geometric units.
 
     Reference codes:
+
     * https://lscsoft.docs.ligo.org/lalsuite/lalsimulation/_l_a_l_sim_neutron_star_t_o_v_8c_source.html
     * https://bitbucket.org/bernuzzi/tov/src/master/TOVL.m
     * https://lscsoft.docs.ligo.org/bilby/_modules/bilby/gw/eos/tov_solver.html
 
+    Parameters
+    ----------
+    eos : EOS
+        Equation of state instance.
+    leven : list of int
+        Multipole indices for even-parity perturbations (Love numbers k, h).
+        Values must be > 1; values <= 1 are silently dropped.
+    lodd : list of int
+        Multipole indices for odd-parity perturbations (Love numbers j).
+        Values must be > 1; values <= 1 are silently dropped.
+    dhfact : float
+        Initial ODE step factor (must be negative, default ``-1e-12``).
+    ode_method : str
+        Integration method forwarded to ``ScipySolver`` / ``solve_ivp``
+        (e.g. ``'DOP853'``, ``'RK45'``).  Ignored for ``'numba'`` and
+        ``'jax'`` backends.
+    ode_atol : float
+        Absolute ODE tolerance (default ``1e-6``).
+    ode_rtol : float
+        Relative ODE tolerance (default ``1e-6``).
+    ode_backend : str or ODESolver
+        ODE solver backend.  Accepts:
+
+        * ``'scipy'`` (default) — wraps :func:`scipy.integrate.solve_ivp`;
+          ``ode_method`` selects the algorithm.
+        * ``'numba'`` — pure-NumPy adaptive Dormand-Prince RK45; independent
+          of scipy; structured for future Numba JIT once the EOS layer is
+          numba-compatible.
+        * ``'jax'`` — JAX/diffrax Dopri5 with a fully XLA-JIT-compiled native
+          RHS; ~3× faster than scipy after one-time JIT compilation warmup;
+          requires ``pip install "jax[cpu]" diffrax``.
+        * A pre-instantiated :class:`~tovpy.solvers.ODESolver` instance
+          (e.g. ``make_solver('scipy', method='RK45')``).
+
+    Examples
+    --------
+    Basic usage (default scipy backend)::
+
+        tov = TOV(eos=eos)
+        M, R, C = tov.solve(pc)
+
+    With tidal parameters::
+
+        tov = TOV(eos=eos, leven=[2], lodd=[2])
+        M, R, C, k, h, j = tov.solve(pc)
+
+    Alternative backends::
+
+        tov_numba = TOV(eos=eos, ode_backend='numba')
+        tov_jax   = TOV(eos=eos, ode_backend='jax')
+        tov_rk45  = TOV(eos=eos, ode_backend=make_solver('scipy', method='RK45'))
     """
 
     def __init__(self,

@@ -23,7 +23,8 @@ Provides a pluggable solver interface supporting:
   - ``'numba'`` : explicit adaptive RK45 integrator, structured to allow
                   future numba JIT compilation once the EOS layer is
                   numba-compatible.
-  - ``'jax'``   : JAX-based solver (future perspective, not yet implemented).
+  - ``'jax'``   : JAX/diffrax Dopri5 backend with a fully XLA-JIT-compiled
+                  native RHS; requires ``pip install "jax[cpu]" diffrax``.
 
 Usage example::
 
@@ -32,6 +33,7 @@ Usage example::
 
     tov = TOV(eos=my_eos, ode_backend='scipy')          # default
     tov = TOV(eos=my_eos, ode_backend='numba')          # numba backend
+    tov = TOV(eos=my_eos, ode_backend='jax')            # JAX/diffrax backend
     tov = TOV(eos=my_eos, ode_backend=make_solver('scipy', method='RK45'))
 """
 
