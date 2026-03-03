@@ -239,14 +239,39 @@ class JaxSolver(ODESolver):
     """ODE solver backend using JAX (future perspective).
 
     .. note::
-        This backend is not yet implemented.  It is provided as a stub to
-        guide future development of a JAX-based integration path
-        (e.g. via ``diffrax``).
+        This backend is not yet implemented.  It is provided as an
+        architectural stub to guide future development.
+
+        **Requirements for a working JAX implementation:**
+
+        1. **Pure-function RHS** — JAX tracing cannot capture Python objects
+           (``self``).  The TOV RHS must be restructured as a standalone
+           function whose closed-over data consists only of JAX arrays
+           (e.g. the pre-built EOS log-tables already stored as plain NumPy
+           arrays in ``_eos_eval``).
+
+        2. **JAX-compatible EOS evaluation** — replace ``np.interp`` /
+           ``_interp_positive`` with ``jnp.interp`` or an equivalent
+           pure-JAX interpolation.  The ``_eos_eval`` closure in ``TOV`` is
+           already structured for this: once its body is ported to ``jnp``
+           operations the same closure pattern works under JAX.
+
+        3. **ODE integrator** — use a JAX-native integrator such as
+           ``diffrax`` (``diffrax.diffeqsolve``) or a custom ``jax.lax.while_loop``
+           based implementation.
+
+        4. **No Python control flow on traced values** — all branching in
+           the RHS must be static (compile-time constants), which is already
+           the case in the current design (even/odd perturbation updates are
+           pre-bound at construction, not evaluated inside the hot loop).
+
+        Contributions are welcome!
     """
 
     def solve(self, rhs, t_span, y0, first_step=None, rtol=1e-9, atol=1e-9, **kwargs):
         raise NotImplementedError(
             "The JAX ODE backend is not yet implemented. "
+            "See the JaxSolver docstring for the requirements. "
             "Contributions are welcome!"
         )
 

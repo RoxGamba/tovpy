@@ -142,8 +142,18 @@ class TOV(object):
             for l in self.lodd
         ]
 
-        # Pre-build EOS tables for fast log-log interpolation in the RHS
+        # Pre-build EOS tables for fast log-log interpolation in the RHS, and
+        # bind the EOS evaluation wrapper (dispatched once here, not per step)
         self._build_eos_tables()
+
+        # Bind perturbation update methods — no branching at RHS call time.
+        # If no perturbations are requested the method is a no-op.
+        self._update_even = (
+            self._apply_even_perts if len(self.leven) else lambda dy, y, m, r, p, e, dedp, dr_dh, dnu_dr: None
+        )
+        self._update_odd = (
+            self._apply_odd_perts if len(self.lodd) else lambda dy, y, m, r, p, e, dedp, dr_dh: None
+        )
 
         
     def __buildvars(self):
@@ -165,11 +175,15 @@ class TOV(object):
         for use in the fast RHS interpolation path.
 
         Tables stored (all 1-D, contiguous, float64):
-          _log_h    : log(h) values (sorted ascending)
-          _log_p    : log(p) values (same ordering as h)
-          _log_e    : log(e) values
-          _log_dedp : log(dedp) values, sorted by ascending log(p)
+          _log_h        : log(h) values (sorted ascending)
+          _log_p        : log(p) values (same ordering as h)
+          _log_e        : log(e) values
           _log_p_sorted : log(p) sorted ascending (key for dedp lookup)
+          _log_dedp     : log(dedp) values, sorted by ascending log(p)
+
+        Also binds ``self._eos_eval(h) -> (p, e, dedp)`` once, choosing the
+        Numba JIT path or the ``np.interp`` path depending on availability.
+        No branching occurs at RHS call time.
         """
         try:
             p_min = float(self.eos.p_min) * 1.001  # small buffer avoids interpolation boundary issues
@@ -199,6 +213,31 @@ class TOV(object):
         p_idx = np.argsort(p_arr)
         self._log_p_sorted = np.ascontiguousarray(np.log(p_arr[p_idx]))
         self._log_dedp     = np.ascontiguousarray(np.log(dedp_arr[p_idx]))
+
+        # Bind the EOS evaluation function once — no if-else at RHS call time.
+        # Capture table references in a closure so the resulting callable is a
+        # plain function with no Python attribute access (forward-compatible with
+        # JAX once the interpolation is ported to jnp operations).
+        log_h = self._log_h;  log_p = self._log_p;  log_e = self._log_e
+        log_p_sorted = self._log_p_sorted;  log_dedp = self._log_dedp
+
+        if _NUMBA_AVAILABLE:
+            # JIT-compiled O(log n) binary search; no Python overhead per call
+            def _eos_eval(h):
+                p    = _interp_positive(h, log_h, log_p)
+                e    = _interp_positive(h, log_h, log_e)
+                dedp = _interp_positive(p, log_p_sorted, log_dedp)
+                return p, e, dedp
+        else:
+            # np.interp is C-implemented; equivalent speed without Numba
+            def _eos_eval(h):
+                lh   = np.log(h)
+                p    = np.exp(np.interp(lh, log_h, log_p))
+                e    = np.exp(np.interp(lh, log_h, log_e))
+                dedp = np.exp(np.interp(np.log(p), log_p_sorted, log_dedp))
+                return p, e, dedp
+
+        self._eos_eval = _eos_eval
 
     
     def __pert_even(self,ell,m,r,p,e,dedp,dnu_dr=[]):
@@ -243,7 +282,25 @@ class TOV(object):
             C0[l] = exp_lam*( -Lam*div_r2 + 6*m*div_r3 - 4*np.pi*(e-p) )
         return C1, C0
 
-    def __tov_rhs(self,h,y):
+    def _apply_even_perts(self, dy, y, m, r, p, e, dedp, dr_dh, dnu_dr):
+        """Apply even-parity perturbation equations to derivative vector *dy*."""
+        C1, C0 = self.__pert_even(self.leven, m, r, p, e, dedp, dnu_dr)
+        for l, (iH, idH) in zip(self.leven, self._even_idx):
+            H  = y[iH]
+            dH = y[idH]
+            dy[iH]  = dH * dr_dh
+            dy[idH] = -(C0[l] * H + C1 * dH) * dr_dh
+
+    def _apply_odd_perts(self, dy, y, m, r, p, e, dedp, dr_dh):
+        """Apply odd-parity perturbation equations to derivative vector *dy*."""
+        C1, C0 = self.__pert_odd(self.lodd, m, r, p, e, dedp)
+        for l, (iPsi, idPsi) in zip(self.lodd, self._odd_idx):
+            Psi  = y[iPsi]
+            dPsi = y[idPsi]
+            dy[iPsi]  = dPsi * dr_dh
+            dy[idPsi] = -(C0[l] * Psi + C1 * dPsi) * dr_dh
+
+    def __tov_rhs(self, h, y):
         """
         ODE r.h.s. for TOV equations with pseudo-enthalpy independent variable.
         Implements Eqs. (5) and (6) of Lindblom, Astrophys. J. 398, 569 (1992).
@@ -251,49 +308,32 @@ class TOV(object):
         Eqs. (18), (27), (28) of Damour & Nagar, Phys. Rev. D 80, 084035 (2009)
         for the metric perturbation used to obtain the Love number.
 
-        Uses cached integer indices and pre-built log-space EOS tables to avoid
-        dict lookups on every step.  When Numba is available the JIT-compiled
-        ``_interp_positive`` is used; otherwise ``np.interp`` is used.
+        Uses cached integer indices and the pre-bound ``self._eos_eval`` wrapper
+        (JIT or ``np.interp``, selected once at construction).
+        ``self._update_even`` and ``self._update_odd`` are similarly pre-bound
+        to the actual perturbation methods or no-ops, so this function contains
+        no branching regardless of the active configuration.
+
+        .. note:: **JAX compatibility**
+            Making this RHS JAX-traceable requires restructuring it as a
+            standalone pure function (no ``self`` capture, no Python attribute
+            access).  The ``_eos_eval`` closure already captures only array
+            data and is JAX-portable once its internals are ported to
+            ``jnp`` operations.  The ``JaxSolver`` stub documents the remaining
+            requirements.
         """
         dy = np.zeros_like(y)
-        # Cached integer indices — no dict lookup
         r = y[self._i_r]
         m = y[self._i_m]
-        # EOS via pre-built log tables
-        if _NUMBA_AVAILABLE:
-            # JIT-compiled binary search: O(log n) with no Python overhead
-            p    = _interp_positive(h, self._log_h, self._log_p)
-            e    = _interp_positive(h, self._log_h, self._log_e)
-            dedp = _interp_positive(p, self._log_p_sorted, self._log_dedp)
-        else:
-            # np.interp is C-implemented and faster than a pure-Python loop
-            lh = np.log(h)
-            p    = np.exp(np.interp(lh, self._log_h, self._log_p))
-            e    = np.exp(np.interp(lh, self._log_h, self._log_e))
-            dedp = np.exp(np.interp(np.log(p), self._log_p_sorted, self._log_dedp))
-        # TOV
-        dr_dh  = -r * (r - 2.0 * m)/(m + 4.0*np.pi*r**3*p)
-        dm_dh  = 4.0 * np.pi * r**2 * e * dr_dh
+        p, e, dedp = self._eos_eval(h)
+        dr_dh  = -r * (r - 2.0 * m) / (m + 4.0 * np.pi * r**3 * p)
+        dm_dh  =  4.0 * np.pi * r**2 * e * dr_dh
         dnu_dr =  2.0 * (m + 4.0 * np.pi * r**3 * p) / (r * (r - 2.0 * m))
         dy[self._i_r]  = dr_dh
         dy[self._i_m]  = dm_dh
         dy[self._i_nu] = dnu_dr * dr_dh
-        # Even perturbations
-        if len(self.leven) != 0:
-            C1,C0 = self.__pert_even(self.leven,m,r,p,e,dedp,dnu_dr)
-            for l, (iH, idH) in zip(self.leven, self._even_idx):
-                H  = y[iH]
-                dH = y[idH]
-                dy[iH]  = dH * dr_dh
-                dy[idH] = -(C0[l] * H + C1 * dH) * dr_dh
-        # Odd perturbations
-        if len(self.lodd) != 0:
-            C1,C0 = self.__pert_odd(self.lodd,m,r,p,e,dedp)
-            for l, (iPsi, idPsi) in zip(self.lodd, self._odd_idx):
-                Psi  = y[iPsi]
-                dPsi = y[idPsi]
-                dy[iPsi]  = dPsi * dr_dh
-                dy[idPsi] = -(C0[l] * Psi + C1 * dPsi) * dr_dh
+        self._update_even(dy, y, m, r, p, e, dedp, dr_dh, dnu_dr)
+        self._update_odd(dy, y, m, r, p, e, dedp, dr_dh)
         return dy
 
     def __initial_data(self,pc,dh_fact=-1e-12,verbose=False):
@@ -317,9 +357,9 @@ class TOV(object):
         # Series expansion for the initial core 
         r0 *= 1.0 + 0.25 * dh * (ec - 3.0 * pc  - 0.6 * dedh_c) / (ec + 3.0 * pc) # second factor Eq. (7) of Lindblom (1992) 
         m0 *= 1.0 + 0.6 * dh * dedh_c / ec # second factor of Eq. (8) of Lindblom (1992) 
-        y[self.var['r']]  = r0
-        y[self.var['m']]  = m0
-        y[self.var['nu']] = 0.0
+        y[self._i_r]  = r0
+        y[self._i_m]  = m0
+        y[self._i_nu] = 0.0
         #  Initial data for the ell-perturbation
         a0 = 1.0
         if len(self.leven)!= 0:
@@ -358,7 +398,7 @@ class TOV(object):
         # Mass, Radius & Compactness
         M,R,C = self.__compute_mass_radius(y)
         # Match to Schwarzschild exterior
-        sol.y[self.var['nu'],:] += np.log(1.0-(2.*M)/R) - sol.y[self.var['nu'],-1]
+        sol.y[self._i_nu, :] += np.log(1.0-(2.*M)/R) - sol.y[self._i_nu, -1]
 
         self.sol = sol
         if len(self.leven) != 0:
@@ -437,8 +477,8 @@ class TOV(object):
         """
         Compute baryon mass
         """
-        r = sol.y[self.var['r'],:]
-        m = sol.y[self.var['m'],:]
+        r = sol.y[self._i_r, :]
+        m = sol.y[self._i_m, :]
         # e = self.EOSEnergyDensityOfPseudoEnthalpyGeometerized(sol.t,self.eos)
         e = np.array([self.eos.EnergyDensity_Of_PseudoEnthalpy(sol.t[i]) for i in range(len(sol.t))])
         return np.trapz( 4*np.pi*r**2.*e/np.sqrt(1-2*m/r), r )
@@ -447,8 +487,8 @@ class TOV(object):
         """
         Compute baryon mass
         """
-        r = sol.y[self.var['r'],:]
-        m = sol.y[self.var['m'],:]
+        r = sol.y[self._i_r, :]
+        m = sol.y[self._i_m, :]
         return np.trapz( r, 1./np.sqrt((1-2*m/r)), r )
         
     def __compute_Love_odd(self,ell,c,y):
