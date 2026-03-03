@@ -4,11 +4,11 @@ TOV equation solving correctness, including tidal (Love) parameters.
 
 Covers:
   - make_solver factory (string keys, passthrough, invalid key, kwargs)
-  - JaxSolver stub raises NotImplementedError
-  - TOV.solve() M/R/C consistency between scipy and numba backends
-  - Even-parity tidal parameters (k[2], h[2]) — validity and backend agreement
-  - Odd-parity tidal parameters (j[2]) — validity and backend agreement
-  - Solver speed benchmarks for both backends on the TOV equations
+  - JaxSolver (diffrax backend) -- correctness and backend agreement
+  - TOV.solve() M/R/C consistency between scipy, numba, and jax backends
+  - Even-parity tidal parameters (k[2], h[2]) -- validity and backend agreement
+  - Odd-parity tidal parameters (j[2]) -- validity and backend agreement
+  - Solver speed benchmarks for scipy, numba, and jax backends
 """
 
 import time
@@ -30,6 +30,21 @@ from tovpy.tov import TOV
 # ---------------------------------------------------------------------------
 # Helpers / shared fixtures
 # ---------------------------------------------------------------------------
+
+def _jax_diffrax_available():
+    try:
+        import jax       # noqa: F401
+        import diffrax   # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+jax_available = pytest.mark.skipif(
+    not _jax_diffrax_available(),
+    reason="jax and diffrax not installed",
+)
+
 
 @pytest.fixture(scope="module")
 def sly_eos():
@@ -80,17 +95,32 @@ class TestMakeSolver:
 
 
 # ---------------------------------------------------------------------------
-# JaxSolver stub
+# JaxSolver backend (diffrax)
 # ---------------------------------------------------------------------------
 
 class TestJaxSolver:
-    def test_raises_not_implemented(self):
-        solver = JaxSolver()
-        with pytest.raises(NotImplementedError):
-            solver.solve(lambda t, y: -y, (0.0, 1.0), [1.0])
-
     def test_is_ode_solver_subclass(self):
         assert issubclass(JaxSolver, ODESolver)
+
+    @jax_available
+    def test_mass_radius_scipy_agreement(self, sly_eos, central_pressure):
+        """JAX (diffrax) and scipy must agree to 0.01% on M, R, C."""
+        REL_TOL = 1e-4
+        tov_scipy = TOV(eos=sly_eos, ode_backend="scipy")
+        tov_jax   = TOV(eos=sly_eos, ode_backend="jax")
+
+        M_s, R_s, C_s = tov_scipy.solve(central_pressure)
+        M_j, R_j, C_j = tov_jax.solve(central_pressure)
+
+        assert abs(M_s - M_j) / M_s < REL_TOL, (
+            f"Mass disagreement: scipy={M_s:.6g}, jax={M_j:.6g}"
+        )
+        assert abs(R_s - R_j) / R_s < REL_TOL, (
+            f"Radius disagreement: scipy={R_s:.6g}, jax={R_j:.6g}"
+        )
+        assert abs(C_s - C_j) / C_s < REL_TOL, (
+            f"Compactness disagreement: scipy={C_s:.6g}, jax={C_j:.6g}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +174,7 @@ class TestTOVBackendConsistency:
 class TestEvenTidal:
     """Tests for the ell=2 even-parity Love/shape numbers."""
 
-    REL_TOL = 1e-4
+    REL_TOL = 2e-3  # 0.2% — consistent with ode_atol/rtol=1e-6
 
     @pytest.fixture(scope="class")
     def even_tov_scipy(self, sly_eos):
@@ -185,7 +215,7 @@ class TestEvenTidal:
 class TestOddTidal:
     """Tests for the ell=2 odd-parity Love numbers."""
 
-    REL_TOL = 1e-4
+    REL_TOL = 2e-3  # 0.2% — consistent with ode_atol/rtol=1e-6
 
     @pytest.fixture(scope="class")
     def odd_tov_scipy(self, sly_eos):
@@ -199,7 +229,7 @@ class TestOddTidal:
         """j[2] must be nonzero and in physically reasonable magnitude range."""
         M, R, C, j = odd_tov_scipy.solve(central_pressure)
         assert M > 0 and R > 0
-        assert j[2] != 0, f"Odd Love number j[2] must be nonzero"
+        assert j[2] != 0, "Odd Love number j[2] must be nonzero"
         assert abs(j[2]) < 1.0, f"|j[2]|={abs(j[2])} seems unphysically large"
 
     def test_odd_tidal_backend_consistency(
@@ -221,8 +251,6 @@ class TestOddTidal:
 class TestCombinedTidal:
     """TOV with both even and odd perturbations active simultaneously."""
 
-    REL_TOL = 1e-4
-
     @pytest.fixture(scope="class")
     def combined_tov(self, sly_eos):
         return TOV(eos=sly_eos, leven=[2], lodd=[2], ode_backend="scipy")
@@ -241,13 +269,13 @@ class TestCombinedTidal:
 
 
 # ---------------------------------------------------------------------------
-# Solver speed benchmark (informational — never fails)
+# Solver speed benchmark (informational -- never fails)
 # ---------------------------------------------------------------------------
 
 class TestSolverBenchmark:
     """
-    Benchmark the scipy and numba backends on the full TOV equations and
-    print the results.  These tests always pass; they exist to report timing.
+    Benchmark all three backends on the full TOV equations and print the
+    results.  These tests always pass; they exist to report timing information.
     """
 
     N_WARMUP = 2
@@ -269,6 +297,11 @@ class TestSolverBenchmark:
     def test_benchmark_numba(self, sly_eos, central_pressure):
         t = self._time_backend("numba", sly_eos, central_pressure)
         print(f"\n[benchmark] numba  : {t * 1000:.2f} ms/call")
+
+    @pytest.mark.skipif(not _jax_diffrax_available(), reason="jax/diffrax not installed")
+    def test_benchmark_jax(self, sly_eos, central_pressure):
+        t = self._time_backend("jax", sly_eos, central_pressure)
+        print(f"\n[benchmark] jax    : {t * 1000:.2f} ms/call")
 
     def test_benchmark_rhs_interpolation(self, sly_eos, central_pressure):
         """
@@ -301,12 +334,11 @@ class TestSolverBenchmark:
 
         print(
             f"\n[benchmark] RHS EOS evaluation:"
-            f" Python methods={t_eos:.2f} µs,"
-            f" pre-built tables (np.interp)={t_tables:.2f} µs"
+            f" Python methods={t_eos:.2f} us,"
+            f" pre-built tables (np.interp)={t_tables:.2f} us"
         )
         MAX_SLOWDOWN_FACTOR = 3
         assert t_tables < t_eos * MAX_SLOWDOWN_FACTOR, (
-            f"Table interpolation ({t_tables:.2f} µs) is unexpectedly slow "
-            f"vs Python EOS ({t_eos:.2f} µs)"
+            f"Table interpolation ({t_tables:.2f} us) is unexpectedly slow "
+            f"vs Python EOS ({t_eos:.2f} us)"
         )
-

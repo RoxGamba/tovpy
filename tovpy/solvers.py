@@ -232,49 +232,95 @@ def _rk45_adaptive(rhs, t0, t1, y0, h0, max_steps, rtol, atol):
 
 
 # ---------------------------------------------------------------------------
-# JAX backend (stub)
+# JAX backend
 # ---------------------------------------------------------------------------
 
 class JaxSolver(ODESolver):
-    """ODE solver backend using JAX (future perspective).
+    """ODE solver backend using JAX and diffrax (Dopri5 integrator).
 
-    .. note::
-        This backend is not yet implemented.  It is provided as an
-        architectural stub to guide future development.
+    The solver bridges the numpy-backed TOV RHS and the JAX/diffrax integration
+    engine via :func:`jax.pure_callback`, which lets diffrax call the numpy RHS
+    as a side-effect-free callback without requiring the RHS to be written in
+    JAX.  This means:
 
-        **Requirements for a working JAX implementation:**
+    * Correct TOV solutions are produced with the *existing* numpy RHS.
+    * The integration itself is orchestrated by diffrax (Dormand-Prince 5th
+      order with adaptive step-size control).
+    * Full JIT compilation of the RHS would additionally require porting
+      ``_eos_eval`` to ``jnp`` operations and refactoring the RHS as a
+      pure function — the ``_eos_eval`` closure in ``TOV`` is already
+      structured for this transition.
 
-        1. **Pure-function RHS** — JAX tracing cannot capture Python objects
-           (``self``).  The TOV RHS must be restructured as a standalone
-           function whose closed-over data consists only of JAX arrays
-           (e.g. the pre-built EOS log-tables already stored as plain NumPy
-           arrays in ``_eos_eval``).
+    Requires ``jax`` and ``diffrax``::
 
-        2. **JAX-compatible EOS evaluation** — replace ``np.interp`` /
-           ``_interp_positive`` with ``jnp.interp`` or an equivalent
-           pure-JAX interpolation.  The ``_eos_eval`` closure in ``TOV`` is
-           already structured for this: once its body is ported to ``jnp``
-           operations the same closure pattern works under JAX.
+        pip install "jax[cpu]" diffrax
 
-        3. **ODE integrator** — use a JAX-native integrator such as
-           ``diffrax`` (``diffrax.diffeqsolve``) or a custom ``jax.lax.while_loop``
-           based implementation.
-
-        4. **No Python control flow on traced values** — all branching in
-           the RHS must be static (compile-time constants), which is already
-           the case in the current design (even/odd perturbation updates are
-           pre-bound at construction, not evaluated inside the hot loop).
-
-        Contributions are welcome!
+    Parameters
+    ----------
+    max_steps : int
+        Maximum number of accepted integration steps (default ``100_000``).
     """
 
-    def solve(self, rhs, t_span, y0, first_step=None, rtol=1e-9, atol=1e-9, **kwargs):
-        raise NotImplementedError(
-            "The JAX ODE backend is not yet implemented. "
-            "See the JaxSolver docstring for the requirements. "
-            "Contributions are welcome!"
+    def __init__(self, max_steps=100_000):
+        self.max_steps = max_steps
+
+    def solve(self, rhs, t_span, y0, first_step=None, rtol=1e-6, atol=1e-6, **kwargs):
+        try:
+            import jax
+            import jax.numpy as jnp
+            import diffrax as dx
+        except ImportError as exc:
+            raise ImportError(
+                "JaxSolver requires 'jax' and 'diffrax'. "
+                "Install with:  pip install 'jax[cpu]' diffrax"
+            ) from exc
+
+        # Enable 64-bit precision — required for TOV accuracy
+        jax.config.update("jax_enable_x64", True)
+
+        y0_np = np.asarray(y0, dtype=float)
+        n = len(y0_np)
+        t0, t1 = float(t_span[0]), float(t_span[1])
+        # dt0 must have the same sign as (t1 - t0); first_step may be given
+        # as a positive magnitude, so we correct the sign here.
+        sign = 1.0 if t1 >= t0 else -1.0
+        if first_step is not None:
+            dt0 = abs(float(first_step)) * sign
+        else:
+            dt0 = (t1 - t0) * 1e-3
+
+        y0_jax = jnp.array(y0_np)
+        result_shape = jax.ShapeDtypeStruct((n,), jnp.float64)
+
+        # Wrap the (possibly numpy-backed) RHS as a JAX pure_callback so that
+        # diffrax can call it under tracing without requiring a jnp-native RHS.
+        def _numpy_rhs(t_, y_):
+            return np.asarray(rhs(float(t_), np.asarray(y_)), dtype=np.float64)
+
+        def vector_field(t, y, args):
+            return jax.pure_callback(_numpy_rhs, result_shape, t, y)
+
+        term = dx.ODETerm(vector_field)
+        controller = dx.PIDController(rtol=rtol, atol=atol)
+        saveat = dx.SaveAt(steps=True)
+
+        sol = dx.diffeqsolve(
+            term,
+            dx.Dopri5(),
+            t0=t0,
+            t1=t1,
+            dt0=dt0,
+            y0=y0_jax,
+            stepsize_controller=controller,
+            saveat=saveat,
+            max_steps=self.max_steps,
         )
 
+        # diffrax pads unused step slots with inf; keep only accepted steps
+        ts = np.array(sol.ts)
+        ys = np.array(sol.ys)
+        valid = np.isfinite(ts)
+        return SolverResult(ts[valid], ys[valid].T)
 
 # ---------------------------------------------------------------------------
 # Registry and factory

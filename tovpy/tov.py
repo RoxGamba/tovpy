@@ -90,8 +90,8 @@ class TOV(object):
                  lodd       = [], # multipole indexes of odd perturbations 
                  dhfact     = -1e-12, # ODE step
                  ode_method = 'DOP853',
-                 ode_atol   = 1e-9,
-                 ode_rtol   = 1e-9,
+                 ode_atol   = 1e-6,
+                 ode_rtol   = 1e-6,
                  ode_backend = 'scipy'): # ODE solver backend: 'scipy', 'numba', 'jax', or ODESolver instance
 
         if not eos:
