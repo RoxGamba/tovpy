@@ -239,7 +239,111 @@ class TOV(object):
 
         self._eos_eval = _eos_eval
 
-    
+    def _get_jax_rhs(self):
+        """Return a native JAX RHS, building and caching it on first call.
+
+        Returns ``None`` if JAX is not installed.  The returned function has a
+        stable Python identity, which allows diffrax to cache its JIT-compiled
+        integration across multiple :meth:`solve` calls.
+        """
+        if not hasattr(self, '_jax_rhs_cached'):
+            self._jax_rhs_cached = self._build_jax_rhs()
+        return self._jax_rhs_cached
+
+    def _build_jax_rhs(self):
+        """Build a native JAX / XLA RHS using ``jnp`` operations throughout.
+
+        The returned callable ``jax_rhs(h, y) -> jnp.ndarray`` mirrors
+        :meth:`__tov_rhs` but replaces all NumPy operations with their JAX
+        equivalents so that diffrax can JIT-compile the entire integration loop
+        in a single XLA kernel.
+
+        * EOS interpolation uses ``jnp.interp`` on the pre-built log-tables.
+        * Perturbation loops are *statically unrolled* at Python level (compile-
+          time constants) — JAX sees no Python control flow.
+        * Array updates use ``dy.at[i].set(v)`` (JAX immutable semantics).
+
+        Returns ``None`` if JAX is not installed.
+        """
+        try:
+            import jax
+            import jax.numpy as jnp
+        except ImportError:
+            return None
+
+        # Required for TOV accuracy; also set by JaxSolver.solve() before
+        # calling this.  Calling it here too ensures the EOS tables are
+        # created with the correct float64 dtype in standalone use.
+        jax.config.update("jax_enable_x64", True)
+
+        # Convert EOS tables to JAX arrays (captured once in closure)
+        log_h        = jnp.array(self._log_h)
+        log_p        = jnp.array(self._log_p)
+        log_e        = jnp.array(self._log_e)
+        log_p_sorted = jnp.array(self._log_p_sorted)
+        log_dedp_jax = jnp.array(self._log_dedp)
+
+        # Static Python data — treated as compile-time constants by JAX
+        i_r, i_m, i_nu = self._i_r, self._i_m, self._i_nu
+        nvar      = self.nvar
+        even_idx  = list(self._even_idx)
+        leven_l   = list(self.leven)
+        odd_idx   = list(self._odd_idx)
+        lodd_l    = list(self.lodd)
+        pi        = float(np.pi)
+
+        def eos_eval_jax(h):
+            lh   = jnp.log(h)
+            p    = jnp.exp(jnp.interp(lh, log_h, log_p))
+            e    = jnp.exp(jnp.interp(lh, log_h, log_e))
+            dedp = jnp.exp(jnp.interp(jnp.log(p), log_p_sorted, log_dedp_jax))
+            return p, e, dedp
+
+        def jax_rhs(h, y):
+            r = y[i_r]
+            m = y[i_m]
+            p, e, dedp = eos_eval_jax(h)
+            dr_dh  = -r * (r - 2.0 * m) / (m + 4.0 * pi * r**3 * p)
+            dm_dh  =  4.0 * pi * r**2 * e * dr_dh
+            dnu_dr =  2.0 * (m + 4.0 * pi * r**3 * p) / (r * (r - 2.0 * m))
+            dy = jnp.zeros(nvar, dtype=jnp.float64)
+            dy = dy.at[i_r].set(dr_dh)
+            dy = dy.at[i_m].set(dm_dh)
+            dy = dy.at[i_nu].set(dnu_dr * dr_dh)
+
+            # Even perturbations — Python loop is unrolled at JAX trace time
+            for l_val, (iH, idH) in zip(leven_l, even_idx):
+                Lam     = float(l_val * (l_val + 1))
+                div_r   = 1.0 / r
+                div_r2  = div_r ** 2
+                exp_lam = 1.0 / (1.0 - 2.0 * m * div_r)
+                C1_e = 2.0/r + exp_lam * (2.0*m*div_r2 + 4.0*pi*r*(p - e))
+                C0_e = -(dnu_dr**2) + exp_lam * (
+                    -Lam*div_r2 + 4.0*pi*(5.0*e + 9.0*p + (e + p)*dedp))
+                H  = y[iH]
+                dH = y[idH]
+                dy = dy.at[iH].set(dH * dr_dh)
+                dy = dy.at[idH].set(-(C0_e * H + C1_e * dH) * dr_dh)
+
+            # Odd perturbations — Python loop is unrolled at JAX trace time
+            for l_val, (iPsi, idPsi) in zip(lodd_l, odd_idx):
+                Lam     = float(l_val * (l_val + 1))
+                div_r   = 1.0 / r
+                div_r2  = div_r ** 2
+                div_r3  = div_r * div_r2
+                r3      = r * r * r
+                exp_lam = 1.0 / (1.0 - 2.0 * m * div_r)
+                C1_o = exp_lam * (2.0*m + 4.0*pi*r3*(p - e)) * div_r2
+                C0_o = exp_lam * (-Lam*div_r2 + 6.0*m*div_r3 - 4.0*pi*(e - p))
+                Psi  = y[iPsi]
+                dPsi = y[idPsi]
+                dy = dy.at[iPsi].set(dPsi * dr_dh)
+                dy = dy.at[idPsi].set(-(C0_o * Psi + C1_o * dPsi) * dr_dh)
+
+            return dy
+
+        return jax_rhs
+
     def __pert_even(self,ell,m,r,p,e,dedp,dnu_dr=[]):
         """
         Eq.(27-29) of Damour & Nagar, Phys. Rev. D 80, 084035 (2009)

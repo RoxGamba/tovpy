@@ -238,18 +238,16 @@ def _rk45_adaptive(rhs, t0, t1, y0, h0, max_steps, rtol, atol):
 class JaxSolver(ODESolver):
     """ODE solver backend using JAX and diffrax (Dopri5 integrator).
 
-    The solver bridges the numpy-backed TOV RHS and the JAX/diffrax integration
-    engine via :func:`jax.pure_callback`, which lets diffrax call the numpy RHS
-    as a side-effect-free callback without requiring the RHS to be written in
-    JAX.  This means:
+    When the ``rhs`` passed to :meth:`solve` originates from a :class:`~tovpy.tov.TOV`
+    instance, this solver automatically uses a **native JAX RHS** built by
+    :meth:`~tovpy.tov.TOV._build_jax_rhs` — replacing all NumPy operations with
+    ``jnp`` equivalents so that diffrax can JIT-compile the entire integration
+    loop as a single XLA kernel.  The first call incurs a one-time JIT
+    compilation overhead; all subsequent calls use the cached compiled kernel
+    and run at full XLA speed.
 
-    * Correct TOV solutions are produced with the *existing* numpy RHS.
-    * The integration itself is orchestrated by diffrax (Dormand-Prince 5th
-      order with adaptive step-size control).
-    * Full JIT compilation of the RHS would additionally require porting
-      ``_eos_eval`` to ``jnp`` operations and refactoring the RHS as a
-      pure function — the ``_eos_eval`` closure in ``TOV`` is already
-      structured for this transition.
+    For generic callables that are not JAX-native, the solver falls back to
+    :func:`jax.pure_callback` (which prevents JIT of the RHS body).
 
     Requires ``jax`` and ``diffrax``::
 
@@ -263,6 +261,10 @@ class JaxSolver(ODESolver):
 
     def __init__(self, max_steps=100_000):
         self.max_steps = max_steps
+        # Cache vector_field by id(tov_instance) to ensure JIT-cache stability:
+        # diffrax keys its compiled kernel on function identity, so re-creating
+        # vector_field on each solve() call would re-trigger compilation.
+        self._vf_cache = {}
 
     def solve(self, rhs, t_span, y0, first_step=None, rtol=1e-6, atol=1e-6, **kwargs):
         try:
@@ -290,15 +292,37 @@ class JaxSolver(ODESolver):
             dt0 = (t1 - t0) * 1e-3
 
         y0_jax = jnp.array(y0_np)
-        result_shape = jax.ShapeDtypeStruct((n,), jnp.float64)
 
-        # Wrap the (possibly numpy-backed) RHS as a JAX pure_callback so that
-        # diffrax can call it under tracing without requiring a jnp-native RHS.
-        def _numpy_rhs(t_, y_):
-            return np.asarray(rhs(float(t_), np.asarray(y_)), dtype=np.float64)
+        # Build (or retrieve cached) vector_field.
+        # We key on id(rhs_obj) rather than id(rhs) because bound methods
+        # are created fresh on every attribute access in Python 3 and do not
+        # have stable identity across calls.
+        rhs_obj   = getattr(rhs, '__self__', None)
+        cache_key = id(rhs_obj) if rhs_obj is not None else None
 
-        def vector_field(t, y, args):
-            return jax.pure_callback(_numpy_rhs, result_shape, t, y)
+        if cache_key is not None and cache_key in self._vf_cache:
+            vector_field = self._vf_cache[cache_key]
+        else:
+            # Prefer a native JAX RHS (full XLA JIT) when available
+            jax_rhs_fn = (
+                rhs_obj._get_jax_rhs()
+                if rhs_obj is not None and hasattr(rhs_obj, '_get_jax_rhs')
+                else None
+            )
+            if jax_rhs_fn is not None:
+                _jrhs = jax_rhs_fn  # capture stable reference
+                def vector_field(t, y, args):
+                    return _jrhs(t, y)
+            else:
+                # Fallback: pure_callback (no XLA JIT of the RHS body)
+                result_shape = jax.ShapeDtypeStruct((n,), jnp.float64)
+                def _numpy_rhs(t_, y_):
+                    return np.asarray(rhs(float(t_), np.asarray(y_)), dtype=np.float64)
+                def vector_field(t, y, args):
+                    return jax.pure_callback(_numpy_rhs, result_shape, t, y)
+
+            if cache_key is not None:
+                self._vf_cache[cache_key] = vector_field
 
         term = dx.ODETerm(vector_field)
         controller = dx.PIDController(rtol=rtol, atol=atol)
