@@ -303,6 +303,32 @@ class TestSolverBenchmark:
         t = self._time_backend("jax", sly_eos, central_pressure)
         print(f"\n[benchmark] jax    : {t * 1000:.2f} ms/call")
 
+    @pytest.mark.skipif(not _jax_diffrax_available(), reason="jax/diffrax not installed")
+    def test_benchmark_jax_sequence(self, sly_eos):
+        """JAX sequence benchmark: solving for varying central pressures must be
+        fast after JIT warmup (no re-tracing per call)."""
+        pc_array = np.logspace(-12, -9, 20)
+        tov = TOV(eos=sly_eos, ode_backend="jax")
+        # Warmup: first call triggers JIT compilation
+        tov.solve(pc_array[0])
+        tov.solve(pc_array[-1])
+
+        t0 = time.perf_counter()
+        for pc in pc_array:
+            tov.solve(pc)
+        elapsed = time.perf_counter() - t0
+        ms_per_solve = elapsed / len(pc_array) * 1000
+        print(
+            f"\n[benchmark] jax seq: {elapsed:.3f}s total, "
+            f"{ms_per_solve:.2f} ms/solve ({len(pc_array)} pressures)"
+        )
+        # After JIT compilation, JAX solves with varying inputs should average
+        # no more than 50 ms each (well below the ~800 ms re-tracing penalty).
+        assert ms_per_solve < 50, (
+            f"JAX sequence too slow: {ms_per_solve:.1f} ms/solve; "
+            f"expected <50 ms after JIT compilation"
+        )
+
     def test_benchmark_rhs_interpolation(self, sly_eos, central_pressure):
         """
         Compare the optimized RHS (pre-built tables + np.interp) against a

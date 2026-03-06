@@ -267,6 +267,12 @@ class JaxSolver(ODESolver):
         # diffrax keys its compiled kernel on function identity, so re-creating
         # vector_field on each solve() call would re-trigger compilation.
         self._vf_cache = {}
+        # Cache JIT-compiled solve functions keyed on
+        # (vector_field cache_key, n, rtol, atol, max_steps) so that the
+        # compiled XLA kernel is reused across calls with different dynamic
+        # inputs (t0, t1, dt0, y0).
+        self._jit_solve_cache = {}
+        self._x64_set = False
 
     def solve(self, rhs, t_span, y0, first_step=None, rtol=1e-6, atol=1e-6, **kwargs):
         try:
@@ -279,8 +285,10 @@ class JaxSolver(ODESolver):
                 "Install with:  pip install 'jax[cpu]' diffrax"
             ) from exc
 
-        # Enable 64-bit precision — required for TOV accuracy
-        jax.config.update("jax_enable_x64", True)
+        # Enable 64-bit precision once — required for TOV accuracy
+        if not self._x64_set:
+            jax.config.update("jax_enable_x64", True)
+            self._x64_set = True
 
         y0_np = np.asarray(y0, dtype=float)
         n = len(y0_np)
@@ -326,25 +334,43 @@ class JaxSolver(ODESolver):
             if cache_key is not None:
                 self._vf_cache[cache_key] = vector_field
 
-        term = dx.ODETerm(vector_field)
-        controller = dx.PIDController(rtol=rtol, atol=atol)
-        saveat = dx.SaveAt(steps=True)
+        # Build (or retrieve cached) JIT-compiled diffeqsolve wrapper.
+        # Keying on (cache_key, n, rtol, atol, max_steps) so that changing
+        # any static solver parameter triggers a new compilation, while
+        # varying dynamic inputs (t0, t1, dt0, y0) reuses the cached kernel.
+        jit_key = (cache_key, n, rtol, atol, self.max_steps)
+        if jit_key not in self._jit_solve_cache:
+            _vf = vector_field
+            _max_steps = self.max_steps
 
-        sol = dx.diffeqsolve(
-            term,
-            dx.Dopri5(),
-            t0=t0,
-            t1=t1,
-            dt0=dt0,
-            y0=y0_jax,
-            stepsize_controller=controller,
-            saveat=saveat,
-            max_steps=self.max_steps,
+            @jax.jit
+            def _jit_solve(t0_, t1_, dt0_, y0_):
+                term = dx.ODETerm(_vf)
+                controller = dx.PIDController(rtol=rtol, atol=atol)
+                saveat = dx.SaveAt(steps=True)
+                sol = dx.diffeqsolve(
+                    term,
+                    dx.Dopri5(),
+                    t0=t0_,
+                    t1=t1_,
+                    dt0=dt0_,
+                    y0=y0_,
+                    stepsize_controller=controller,
+                    saveat=saveat,
+                    max_steps=_max_steps,
+                )
+                return sol.ts, sol.ys
+
+            self._jit_solve_cache[jit_key] = _jit_solve
+
+        _jit_solve = self._jit_solve_cache[jit_key]
+        ts_jax, ys_jax = _jit_solve(
+            jnp.float64(t0), jnp.float64(t1), jnp.float64(dt0), y0_jax
         )
 
         # diffrax pads unused step slots with inf; keep only accepted steps
-        ts = np.array(sol.ts)
-        ys = np.array(sol.ys)
+        ts = np.array(ts_jax)
+        ys = np.array(ys_jax)
         valid = np.isfinite(ts)
         return SolverResult(ts[valid], ys[valid].T)
 
