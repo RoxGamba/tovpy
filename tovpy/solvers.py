@@ -261,18 +261,16 @@ class JaxSolver(ODESolver):
         Maximum number of accepted integration steps (default ``100_000``).
     """
 
+    # Class-level cache shared across all JaxSolver instances so that JIT
+    # compiled kernels survive even when fresh solver instances are created
+    # (e.g. one per TOV).  Keyed on structural properties of the computation
+    # (nvar, perturbation layout, table size, tolerances, max_steps), so
+    # different EOS with the same structure share a single XLA kernel.
+    _jit_solve_cache = {}
+    _x64_set = False
+
     def __init__(self, max_steps=100_000):
         self.max_steps = max_steps
-        # Cache vector_field by id(tov_instance) to ensure JIT-cache stability:
-        # diffrax keys its compiled kernel on function identity, so re-creating
-        # vector_field on each solve() call would re-trigger compilation.
-        self._vf_cache = {}
-        # Cache JIT-compiled solve functions keyed on
-        # (vector_field cache_key, n, rtol, atol, max_steps) so that the
-        # compiled XLA kernel is reused across calls with different dynamic
-        # inputs (t0, t1, dt0, y0).
-        self._jit_solve_cache = {}
-        self._x64_set = False
 
     def solve(self, rhs, t_span, y0, first_step=None, rtol=1e-6, atol=1e-6, **kwargs):
         try:
@@ -303,70 +301,96 @@ class JaxSolver(ODESolver):
 
         y0_jax = jnp.array(y0_np)
 
-        # Build (or retrieve cached) vector_field.
-        # We key on id(rhs_obj) rather than id(rhs) because bound methods
-        # are created fresh on every attribute access in Python 3 and do not
-        # have stable identity across calls.
-        rhs_obj   = getattr(rhs, '__self__', None)
-        cache_key = id(rhs_obj) if rhs_obj is not None else None
+        # --- Detect native JAX RHS with dynamic EOS tables ---------------
+        rhs_obj = getattr(rhs, '__self__', None)
+        jax_rhs_fn  = None
+        eos_tables  = None
+        struct_key  = None
 
-        if cache_key is not None and cache_key in self._vf_cache:
-            vector_field = self._vf_cache[cache_key]
-        else:
-            # Prefer a native JAX RHS (full XLA JIT) when available
-            jax_rhs_fn = (
-                rhs_obj._get_jax_rhs()
-                if rhs_obj is not None and hasattr(rhs_obj, '_get_jax_rhs')
-                else None
+        if rhs_obj is not None:
+            if hasattr(rhs_obj, '_get_jax_rhs'):
+                jax_rhs_fn = rhs_obj._get_jax_rhs()
+            if hasattr(rhs_obj, '_get_jax_eos_tables'):
+                eos_tables = rhs_obj._get_jax_eos_tables()
+            if hasattr(rhs_obj, '_get_jax_structural_key'):
+                struct_key = rhs_obj._get_jax_structural_key()
+
+        if jax_rhs_fn is not None and eos_tables is not None and struct_key is not None:
+            # Native path: EOS tables are dynamic args → compiled kernel
+            # is reusable across different EOS with the same structure.
+            jit_key = (struct_key, n, rtol, atol, self.max_steps)
+            if jit_key not in self._jit_solve_cache:
+                _jrhs = jax_rhs_fn
+                _max_steps = self.max_steps
+
+                @jax.jit
+                def _jit_solve(t0_, t1_, dt0_, y0_, eos_tables_):
+                    def vector_field(t, y, args):
+                        return _jrhs(t, y, args)
+                    term = dx.ODETerm(vector_field)
+                    controller = dx.PIDController(rtol=rtol, atol=atol)
+                    saveat = dx.SaveAt(steps=True)
+                    sol = dx.diffeqsolve(
+                        term,
+                        dx.Dopri5(),
+                        t0=t0_,
+                        t1=t1_,
+                        dt0=dt0_,
+                        y0=y0_,
+                        args=eos_tables_,
+                        stepsize_controller=controller,
+                        saveat=saveat,
+                        max_steps=_max_steps,
+                    )
+                    return sol.ts, sol.ys
+
+                self._jit_solve_cache[jit_key] = _jit_solve
+
+            _jit_solve = self._jit_solve_cache[jit_key]
+            ts_jax, ys_jax = _jit_solve(
+                jnp.float64(t0), jnp.float64(t1), jnp.float64(dt0),
+                y0_jax, eos_tables,
             )
-            if jax_rhs_fn is not None:
-                _jrhs = jax_rhs_fn  # capture stable reference
-                def vector_field(t, y, args):
-                    return _jrhs(t, y)
-            else:
-                # Fallback: pure_callback (no XLA JIT of the RHS body)
-                result_shape = jax.ShapeDtypeStruct((n,), jnp.float64)
-                def _numpy_rhs(t_, y_):
-                    return np.asarray(rhs(float(t_), np.asarray(y_)), dtype=np.float64)
-                def vector_field(t, y, args):
-                    return jax.pure_callback(_numpy_rhs, result_shape, t, y)
+        else:
+            # Fallback: pure_callback for non-JAX-native RHS.
+            result_shape = jax.ShapeDtypeStruct((n,), jnp.float64)
+            def _numpy_rhs(t_, y_):
+                return np.asarray(rhs(float(t_), np.asarray(y_)), dtype=np.float64)
+            def vector_field(t, y, args):
+                return jax.pure_callback(_numpy_rhs, result_shape, t, y)
 
-            if cache_key is not None:
-                self._vf_cache[cache_key] = vector_field
+            # Fallback uses a per-rhs-identity cache key since the callback
+            # identity matters for JAX tracing.
+            cache_key = id(rhs_obj) if rhs_obj is not None else id(rhs)
+            jit_key = ('_fallback', cache_key, n, rtol, atol, self.max_steps)
+            if jit_key not in self._jit_solve_cache:
+                _vf = vector_field
+                _max_steps = self.max_steps
 
-        # Build (or retrieve cached) JIT-compiled diffeqsolve wrapper.
-        # Keying on (cache_key, n, rtol, atol, max_steps) so that changing
-        # any static solver parameter triggers a new compilation, while
-        # varying dynamic inputs (t0, t1, dt0, y0) reuses the cached kernel.
-        jit_key = (cache_key, n, rtol, atol, self.max_steps)
-        if jit_key not in self._jit_solve_cache:
-            _vf = vector_field
-            _max_steps = self.max_steps
+                @jax.jit
+                def _jit_solve(t0_, t1_, dt0_, y0_):
+                    term = dx.ODETerm(_vf)
+                    controller = dx.PIDController(rtol=rtol, atol=atol)
+                    saveat = dx.SaveAt(steps=True)
+                    sol = dx.diffeqsolve(
+                        term,
+                        dx.Dopri5(),
+                        t0=t0_,
+                        t1=t1_,
+                        dt0=dt0_,
+                        y0=y0_,
+                        stepsize_controller=controller,
+                        saveat=saveat,
+                        max_steps=_max_steps,
+                    )
+                    return sol.ts, sol.ys
 
-            @jax.jit
-            def _jit_solve(t0_, t1_, dt0_, y0_):
-                term = dx.ODETerm(_vf)
-                controller = dx.PIDController(rtol=rtol, atol=atol)
-                saveat = dx.SaveAt(steps=True)
-                sol = dx.diffeqsolve(
-                    term,
-                    dx.Dopri5(),
-                    t0=t0_,
-                    t1=t1_,
-                    dt0=dt0_,
-                    y0=y0_,
-                    stepsize_controller=controller,
-                    saveat=saveat,
-                    max_steps=_max_steps,
-                )
-                return sol.ts, sol.ys
+                self._jit_solve_cache[jit_key] = _jit_solve
 
-            self._jit_solve_cache[jit_key] = _jit_solve
-
-        _jit_solve = self._jit_solve_cache[jit_key]
-        ts_jax, ys_jax = _jit_solve(
-            jnp.float64(t0), jnp.float64(t1), jnp.float64(dt0), y0_jax
-        )
+            _jit_solve = self._jit_solve_cache[jit_key]
+            ts_jax, ys_jax = _jit_solve(
+                jnp.float64(t0), jnp.float64(t1), jnp.float64(dt0), y0_jax
+            )
 
         # diffrax pads unused step slots with inf; keep only accepted steps
         ts = np.array(ts_jax)

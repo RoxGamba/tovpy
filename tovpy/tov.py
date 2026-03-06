@@ -263,25 +263,67 @@ class TOV(object):
     def _get_jax_rhs(self):
         """Return a native JAX RHS, building and caching it on first call.
 
-        Returns ``None`` if JAX is not installed.  The returned function has a
-        stable Python identity, which allows diffrax to cache its JIT-compiled
-        integration across multiple :meth:`solve` calls.
+        Returns ``None`` if JAX is not installed.  The returned function has
+        signature ``jax_rhs(h, y, eos_tables)`` where *eos_tables* is a tuple
+        of five ``jnp`` arrays ``(log_h, log_p, log_e, log_p_sorted,
+        log_dedp)``.  Passing the EOS data as an argument (rather than closing
+        over it) allows a single JIT-compiled kernel to be reused across
+        different EOS instances that share the same structural layout and table
+        size — see :meth:`_get_jax_structural_key`.
         """
         if not hasattr(self, '_jax_rhs_cached'):
             self._jax_rhs_cached = self._build_jax_rhs()
         return self._jax_rhs_cached
 
+    def _get_jax_eos_tables(self):
+        """Return the pre-built EOS tables as a tuple of ``jnp`` arrays.
+
+        Returns ``None`` if JAX is not installed.
+        """
+        try:
+            import jax.numpy as jnp
+        except ImportError:
+            return None
+        return (
+            jnp.array(self._log_h),
+            jnp.array(self._log_p),
+            jnp.array(self._log_e),
+            jnp.array(self._log_p_sorted),
+            jnp.array(self._log_dedp),
+        )
+
+    def _get_jax_structural_key(self):
+        """Return a hashable key identifying the JAX computational structure.
+
+        Two TOV instances with the same structural key produce identical XLA
+        computation graphs, allowing the JIT-compiled kernel to be shared even
+        when the underlying EOS differs.
+
+        The key includes the state-vector dimension, the perturbation layout,
+        and the EOS table size (JAX requires matching array shapes).
+        """
+        return (
+            self.nvar,
+            tuple(int(l) for l in self.leven),
+            tuple(int(l) for l in self.lodd),
+            len(self._log_h),
+        )
+
     def _build_jax_rhs(self):
         """Build a native JAX / XLA RHS using ``jnp`` operations throughout.
 
-        The returned callable ``jax_rhs(h, y) -> jnp.ndarray`` mirrors
-        :meth:`__tov_rhs` but replaces all NumPy operations with their JAX
-        equivalents so that diffrax can JIT-compile the entire integration loop
-        in a single XLA kernel.
+        The returned callable ``jax_rhs(h, y, eos_tables) -> jnp.ndarray``
+        mirrors :meth:`__tov_rhs` but replaces all NumPy operations with their
+        JAX equivalents so that diffrax can JIT-compile the entire integration
+        loop in a single XLA kernel.
 
-        * EOS interpolation uses ``jnp.interp`` on the pre-built log-tables.
-        * Perturbation loops are *statically unrolled* at Python level (compile-
-          time constants) — JAX sees no Python control flow.
+        EOS tables are passed as an argument (not closed over) so that TOV
+        instances with different EOS but the same structural layout share one
+        compiled kernel.
+
+        * EOS interpolation uses ``jnp.interp`` on the caller-supplied tables.
+        * Perturbation loops are *statically unrolled* at Python level
+          (compile-time constants) — JAX sees no Python control flow.
         * Array updates use ``dy.at[i].set(v)`` (JAX immutable semantics).
 
         Returns ``None`` if JAX is not installed.
@@ -294,12 +336,6 @@ class TOV(object):
 
         jax.config.update("jax_enable_x64", True)
 
-        log_h        = jnp.array(self._log_h)
-        log_p        = jnp.array(self._log_p)
-        log_e        = jnp.array(self._log_e)
-        log_p_sorted = jnp.array(self._log_p_sorted)
-        log_dedp_jax = jnp.array(self._log_dedp)
-
         i_r, i_m, i_nu = self._i_r, self._i_m, self._i_nu
         nvar      = self.nvar
         even_idx  = list(self._even_idx)
@@ -308,17 +344,17 @@ class TOV(object):
         lodd_l    = list(self.lodd)
         pi        = float(np.pi)
 
-        def eos_eval_jax(h):
+        def jax_rhs(h, y, eos_tables):
+            log_h, log_p, log_e, log_p_sorted, log_dedp = eos_tables
+
+            # EOS evaluation via log-space interpolation
             lh   = jnp.log(h)
             p    = jnp.exp(jnp.interp(lh, log_h, log_p))
             e    = jnp.exp(jnp.interp(lh, log_h, log_e))
-            dedp = jnp.exp(jnp.interp(jnp.log(p), log_p_sorted, log_dedp_jax))
-            return p, e, dedp
+            dedp = jnp.exp(jnp.interp(jnp.log(p), log_p_sorted, log_dedp))
 
-        def jax_rhs(h, y):
             r = y[i_r]
             m = y[i_m]
-            p, e, dedp = eos_eval_jax(h)
             dr_dh  = -r * (r - 2.0 * m) / (m + 4.0 * pi * r**3 * p)
             dm_dh  =  4.0 * pi * r**2 * e * dr_dh
             dnu_dr =  2.0 * (m + 4.0 * pi * r**3 * p) / (r * (r - 2.0 * m))
