@@ -333,7 +333,8 @@ class TestSolverBenchmark:
     def test_benchmark_jax_eos_change(self, sly_eos):
         """JAX EOS-change benchmark: switching EOS must reuse the compiled
         kernel (no recompilation) as long as the structural layout matches."""
-        eos_names = ["SLy", "AP1", "AP2", "MPA1", "WFF1"]
+        eos_names = ["SLy", "AP1", "AP2", "AP3", "AP4",
+                     "MPA1", "WFF1", "WFF2", "ENG", "MS1"]
         pc_array = np.logspace(-12, -9, 20)
 
         # Warmup: compile the kernel with the first EOS
