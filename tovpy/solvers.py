@@ -360,7 +360,8 @@ class JaxSolver(ODESolver):
                 return jax.pure_callback(_numpy_rhs, result_shape, t, y)
 
             # Fallback uses a per-rhs-identity cache key since the callback
-            # identity matters for JAX tracing.
+            # identity matters for JAX tracing.  rhs_obj (__self__ of a bound
+            # method) has a stable id; for plain functions rhs itself is stable.
             cache_key = id(rhs_obj) if rhs_obj is not None else id(rhs)
             jit_key = ('_fallback', cache_key, n, rtol, atol, self.max_steps)
             if jit_key not in self._jit_solve_cache:
