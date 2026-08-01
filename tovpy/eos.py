@@ -800,6 +800,15 @@ class EOSTabular(object):
         self.pBins = np.array([self.min_pTab, self.max_pTab])
         self.eBins = np.array([self.min_eTab, self.max_eTab])
 
+        # The pressure range this table actually covers, under the names
+        # TOV._build_eos_tables looks for. Without them that lookup raised
+        # AttributeError for every EOS and silently fell back to a hardcoded
+        # 1e-19..1e-8 window, so any part of a table outside that window was
+        # reached by extrapolating off the end of the pre-sampled grid rather
+        # than by reading the data.
+        self.p_min = self.min_pTab
+        self.p_max = self.max_pTab
+
         self.logpTab = np.log(pTab)
         self.logeTab = np.log(eTab)
 
@@ -1136,6 +1145,17 @@ class EOS(object):
 
     def __init__(self, type, name, **params):
         self.eos = self.get_eos(type, name, **params)
+
+    @property
+    def p_min(self):
+        """Lowest pressure the underlying EOS covers, forwarded so
+        TOV._build_eos_tables can size its pre-sampled grid to the real data."""
+        return self.eos.p_min
+
+    @property
+    def p_max(self):
+        """Highest pressure the underlying EOS covers."""
+        return self.eos.p_max
 
     def get_eos(self, type, name, **params):
         eos_classes = {
