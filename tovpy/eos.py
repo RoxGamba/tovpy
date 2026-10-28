@@ -25,7 +25,6 @@ from scipy.interpolate import make_interp_spline
 from scipy import integrate
 import pandas as pd
 from io import StringIO
-import pkg_resources
 from . import units as units
 
 
@@ -683,6 +682,21 @@ class EOSPiecewisePolytropic(object):
 # EOSPiecewisePolytropic ---
 
 
+def _by_region(x, bins, below, inside, above):
+    """Evaluate below(x), inside(x) or above(x), depending on where x lies
+    relative to the table range ``bins``. Works elementwise on an array and
+    returns a scalar for a scalar."""
+    x = np.asarray(x, dtype=float)
+    region = np.atleast_1d(np.digitize(x, bins))
+    flat = np.atleast_1d(x)
+    out = np.empty_like(flat)
+    for k, f in enumerate((below, inside, above)):
+        m = region == k
+        if m.any():
+            out[m] = f(flat[m])
+    return out[0] if x.ndim == 0 else out.reshape(x.shape)
+
+
 class EOSTabular(object):
     """
 
@@ -800,12 +814,7 @@ class EOSTabular(object):
         self.pBins = np.array([self.min_pTab, self.max_pTab])
         self.eBins = np.array([self.min_eTab, self.max_eTab])
 
-        # The pressure range this table actually covers, under the names
-        # TOV._build_eos_tables looks for. Without them that lookup raised
-        # AttributeError for every EOS and silently fell back to a hardcoded
-        # 1e-19..1e-8 window, so any part of a table outside that window was
-        # reached by extrapolating off the end of the pre-sampled grid rather
-        # than by reading the data.
+        # The pressure range of the table, which TOV._build_eos_tables samples.
         self.p_min = self.min_pTab
         self.p_max = self.max_pTab
 
@@ -863,18 +872,18 @@ class EOSTabular(object):
         Use non-relativistic degenerate gas, p = K * e**(5./3.)
         and return e = K * p**(3./5.) below min pressure
 
-        Usre ultra-relativistic degenerate gas, p = K * e**(4./3.)
+        Use ultra-relativistic degenerate gas, p = K * e**(4./3.)
         and return e = K * p**(3./4.) above max pressure
         """
-        if np.digitize(p, self.pBins) == 0:
-            K = self.min_eTab / self.min_pTab ** (3 / 5)
-            e = K * p ** (3 / 5)
-        elif np.digitize(p, self.pBins) == 1:
-            e = exp(self.interp_logEnergyDensity_from_logPressure(log(p)))
-        else:
-            K = self.max_eTab / self.max_pTab ** (3 / 4)
-            e = K * p ** (3 / 4)
-        return e
+        K_lo = self.min_eTab / self.min_pTab ** (3 / 5)
+        K_hi = self.max_eTab / self.max_pTab ** (3 / 4)
+        return _by_region(
+            p,
+            self.pBins,
+            lambda p: K_lo * p ** (3 / 5),
+            lambda p: exp(self.interp_logEnergyDensity_from_logPressure(log(p))),
+            lambda p: K_hi * p ** (3 / 4),
+        )
 
     def EnergyDensityDeriv_Of_Pressure(self, p, finite_diff=False):
         """
@@ -886,17 +895,14 @@ class EOSTabular(object):
         """
         if finite_diff:
             return self.__EnergyDensityDeriv_Of_Pressure_fd(p)
-        logp = log(p)
-        e = self.EnergyDensity_Of_Pressure(p)
-        # loge = log(e)
-        if np.digitize(p, self.pBins) == 0:
-            dedp = 0.6 * e / p
-        elif np.digitize(p, self.pBins) == 1:
-            dloge_dlogp = self.interp_logEnergyDensity_from_logPressure(logp, 1)
-            dedp = dloge_dlogp * e / p
-        else:
-            dedp = 0.75 * e / p
-        return dedp
+        dloge_dlogp = _by_region(
+            p,
+            self.pBins,
+            lambda p: np.full_like(p, 0.6),
+            lambda p: self.interp_logEnergyDensity_from_logPressure(log(p), 1),
+            lambda p: np.full_like(p, 0.75),
+        )
+        return dloge_dlogp * self.EnergyDensity_Of_Pressure(p) / p
 
     def __EnergyDensityDeriv_Of_Pressure_fd(self, p):
         """
@@ -915,26 +921,15 @@ class EOSTabular(object):
 
         Use ultra-relativistic degenerate gas, h = K * p**(1./4.), above max p
         """
-        # p = np.atleast_1d(p)
-        # h = np.zeros(np.size(p))
-        # ids_lr_min = np.nonzero(np.logical_and(p < self.min_pTab, p > 0.0))
-        # ids_gt_min = np.nonzero(p >= self.min_pTab)
-        # logp = np.log(p)
-        # h[ids_lr_min] = np.exp(self.loghTab[0] + 0.4 * (logp - self.logpTab[0]))
-        # logh = self.interp_logPseudoEnthalpy_from_logPressure(logp)
-        # h[ids_gt_min] = np.exp(logh)
-        # if h.size == 1:
-        #     return h[0]
-        # return h
-        if np.digitize(p, self.pBins) == 0:
-            K = self.min_hTab / self.min_pTab ** (2 / 5)
-            h = K * p ** (2 / 5)
-        elif np.digitize(p, self.pBins) == 1:
-            h = exp(self.interp_logPseudoEnthalpy_from_logPressure(log(p)))
-        else:
-            K = self.max_hTab / self.max_pTab ** (1 / 4)
-            h = K * p ** (1 / 4)
-        return h
+        K_lo = self.min_hTab / self.min_pTab ** (2 / 5)
+        K_hi = self.max_hTab / self.max_pTab ** (1 / 4)
+        return _by_region(
+            p,
+            self.pBins,
+            lambda p: K_lo * p ** (2 / 5),
+            lambda p: exp(self.interp_logPseudoEnthalpy_from_logPressure(log(p))),
+            lambda p: K_hi * p ** (1 / 4),
+        )
 
     """ h-functions """
 
@@ -944,26 +939,15 @@ class EOSTabular(object):
 
         Use ultra-relativistic degenerate gas, e = K * h**3, above max h
         """
-        # h = np.atleast_1d(h)
-        # e = np.zeros(np.size(h))
-        # ids_lr_min = np.nonzero(np.logical_and(h < self.min_hTab, h > 0.0))
-        # ids_gt_min = np.nonzero(h >= self.min_hTab)
-        # logh = np.log(h)
-        # e[ids_lr_min] = np.exp(self.logeTab[0] + 1.5 * (logh[ids_lr_min] - self.loghTab[0]))
-        # loge = self.interp_logEnergyDensity_from_logPseudoEnthalpy(logh)
-        # e[ids_gt_min] = np.exp(loge)
-        # if e.size == 1:
-        #     return e[0]
-        # return e
-        if np.digitize(h, self.hBins) == 0:
-            K = self.min_eTab / self.min_hTab ** (3 / 2)
-            e = K * h ** (3 / 2)
-        elif np.digitize(h, self.hBins) == 1:
-            e = exp(self.interp_logEnergyDensity_from_logPseudoEnthalpy(log(h)))
-        else:
-            K = self.max_eTab / self.max_hTab**3
-            e = K * h**3
-        return e
+        K_lo = self.min_eTab / self.min_hTab ** (3 / 2)
+        K_hi = self.max_eTab / self.max_hTab**3
+        return _by_region(
+            h,
+            self.hBins,
+            lambda h: K_lo * h ** (3 / 2),
+            lambda h: exp(self.interp_logEnergyDensity_from_logPseudoEnthalpy(log(h))),
+            lambda h: K_hi * h**3,
+        )
 
     def Pressure_Of_PseudoEnthalpy(self, h):
         """
@@ -971,26 +955,15 @@ class EOSTabular(object):
 
         Use ultra-relativistic degenerate gas, p = K * h**4, above max h
         """
-        # h = np.atleast_1d(h)
-        # p = np.zeros(np.size(h))
-        # ids_lr_min = np.nonzero(np.logical_and(h < self.min_hTab, h > 0.0))
-        # ids_gt_min = np.nonzero(h >= self.min_hTab)
-        # log_h = np.log(h)
-        # p[ids_lr_min] = np.exp(self.logpTab[0] + 2.5 * (log_h - self.loghTab[0]))
-        # logp = self.interp_logPressure_from_logPseudoEnthalpy(log_h)
-        # p[ids_gt_min] = np.exp(logp)
-        # if p.size == 1:
-        #     return p[0]
-        # return p
-        if np.digitize(h, self.hBins) == 0:
-            K = self.min_pTab / self.min_hTab ** (5 / 2)
-            p = K * h ** (5 / 2)
-        elif np.digitize(h, self.hBins) == 1:
-            p = exp(self.interp_logPressure_from_logPseudoEnthalpy(log(h)))
-        else:
-            K = self.max_pTab / self.max_hTab**4
-            p = K * h**4
-        return p
+        K_lo = self.min_pTab / self.min_hTab ** (5 / 2)
+        K_hi = self.max_pTab / self.max_hTab**4
+        return _by_region(
+            h,
+            self.hBins,
+            lambda h: K_lo * h ** (5 / 2),
+            lambda h: exp(self.interp_logPressure_from_logPseudoEnthalpy(log(h))),
+            lambda h: K_hi * h**4,
+        )
 
     def __EnergyDensityDeriv_Of_PseudoEnthalpy_fd(self, h):
         """

@@ -1,411 +1,285 @@
 """
-Tests for the pluggable ODE solver backends (tovpy/solvers.py) focused on
-TOV equation solving correctness, including tidal (Love) parameters.
+Tests for the ODE backends (tovpy/solvers.py) and the TOV solve built on them.
 
-Covers:
-  - make_solver factory (string keys, passthrough, invalid key, kwargs)
-  - JaxSolver (diffrax backend) -- correctness and backend agreement
-  - TOV.solve() M/R/C consistency between scipy, numba, and jax backends
-  - Even-parity tidal parameters (k[2], h[2]) -- validity and backend agreement
-  - Odd-parity tidal parameters (j[2]) -- validity and backend agreement
-  - Solver speed benchmarks for scipy, numba, and jax backends
+Covers
+  - make_solver with backend names, a ready solver, an unknown backend or method
+  - the TOV equations, the same r.h.s. from numpy and jax.numpy
+  - scipy and jax agree on M, R, C and the Love numbers, for a piecewise
+    polytrope and for a tabulated EOS with linear interpolation
+  - solve and solve_many agree
+  - accuracy against a tight-tolerance reference at the default tolerances
+  - a failed integration comes back as nan, never as a finite star
 """
 
-import time
+import os
 
 import numpy as np
 import pytest
 
-from tovpy.eos import EOSPiecewisePolytropic
-from tovpy.solvers import (
-    JaxSolver,
-    NumbaSolver,
-    ODESolver,
-    ScipySolver,
-    make_solver,
-)
-from tovpy.tov import TOV
+from tovpy.eos import EOS, EOSPiecewisePolytropic
+from tovpy.solvers import JaxSolver, ODESolver, ScipySolver, make_solver
+from tovpy.tov import TOV, TOVEquations
 
 
-# ---------------------------------------------------------------------------
-# Helpers / shared fixtures
-# ---------------------------------------------------------------------------
-
-def _jax_diffrax_available():
+def _jax_available():
     try:
-        import jax       # noqa: F401
-        import diffrax   # noqa: F401
+        import jax  # noqa: F401
+        import diffrax  # noqa: F401
+
         return True
     except ImportError:
         return False
 
 
-jax_available = pytest.mark.skipif(
-    not _jax_diffrax_available(),
-    reason="jax and diffrax not installed",
+needs_jax = pytest.mark.skipif(
+    not _jax_available(), reason="jax and diffrax not installed"
 )
+BACKENDS = ["scipy", pytest.param("jax", marks=needs_jax)]
+
+EOS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "eos")
 
 
 @pytest.fixture(scope="module")
-def sly_eos():
-    """SLy piecewise-polytrope EOS (shared across the module)."""
+def sly():
+    """SLy piecewise polytrope."""
     return EOSPiecewisePolytropic("SLy")
 
 
 @pytest.fixture(scope="module")
-def central_pressure():
-    """Moderate central pressure (geometric units) for a ~2 M_sun star."""
-    return 1e-9
+def sfho():
+    """SFHo with crust, tabulated (e, p) in cgs and interpolated linearly in
+    log space, the way catalogue tables are used."""
+    table = np.loadtxt(os.path.join(EOS_DIR, "SFHo_25-Sept-2017.rns"), skiprows=1)
+    return EOS("tabular", name="from_ndarray", data=table[:, :2], interp_kind="linear")
 
 
-# ---------------------------------------------------------------------------
-# make_solver factory
-# ---------------------------------------------------------------------------
+PC = 1e-9  # geometric units, a ~2 Msun SLy star
+PCS = np.logspace(-10, -9, 6)
+
+
+def _love(result):
+    """M, R, C, k2, h2, j2 from a solve with leven=lodd=[2]."""
+    M, R, C, k, h, j = result
+    return np.array([M, R, C, k[2], h[2], j[2]])
+
 
 class TestMakeSolver:
-    def test_scipy_string(self):
-        s = make_solver("scipy")
-        assert isinstance(s, ScipySolver)
+    def test_scipy(self):
+        assert isinstance(make_solver("scipy"), ScipySolver)
 
-    def test_numba_string(self):
-        s = make_solver("numba")
-        assert isinstance(s, NumbaSolver)
+    @needs_jax
+    def test_jax(self):
+        assert isinstance(make_solver("jax"), JaxSolver)
 
-    def test_jax_string(self):
-        s = make_solver("jax")
-        assert isinstance(s, JaxSolver)
-
-    def test_passthrough_existing_instance(self):
+    def test_ready_solver_used_as_is(self):
         s = ScipySolver()
         assert make_solver(s) is s
 
-    def test_invalid_backend_raises(self):
+    def test_unknown_backend(self):
         with pytest.raises(ValueError, match="Unknown ODE backend"):
-            make_solver("unknown_backend")
+            make_solver("numba")
 
-    def test_scipy_method_kwarg(self):
-        s = make_solver("scipy", method="RK45")
-        assert isinstance(s, ScipySolver)
-        assert s.method == "RK45"
+    def test_method_forwarded(self):
+        assert make_solver("scipy", method="RK45").method == "RK45"
 
-    def test_numba_max_steps_kwarg(self):
-        s = make_solver("numba", max_steps=50_000)
-        assert isinstance(s, NumbaSolver)
-        assert s.max_steps == 50_000
+    @needs_jax
+    def test_jax_unknown_method(self):
+        with pytest.raises(ValueError, match="Unknown method"):
+            make_solver("jax", method="LSODA")
+
+    def test_jax_missing_fails_at_construction(self, monkeypatch):
+        import builtins
+
+        real_import = builtins.__import__
+
+        def no_jax(name, *args, **kwargs):
+            if name in ("jax", "diffrax"):
+                raise ImportError(name)
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", no_jax)
+        with pytest.raises(ImportError, match="needs jax and diffrax"):
+            JaxSolver()
 
 
-# ---------------------------------------------------------------------------
-# JaxSolver backend (diffrax)
-# ---------------------------------------------------------------------------
+class TestEquations:
+    @needs_jax
+    def test_numpy_and_jax_agree(self, sly):
+        import jax
+        import jax.numpy as jnp
 
-class TestJaxSolver:
-    def test_is_ode_solver_subclass(self):
-        assert issubclass(JaxSolver, ODESolver)
-
-    @jax_available
-    def test_mass_radius_scipy_agreement(self, sly_eos, central_pressure):
-        """JAX (diffrax) and scipy must agree to 0.01% on M, R, C."""
-        REL_TOL = 1e-4
-        tov_scipy = TOV(eos=sly_eos, ode_backend="scipy")
-        tov_jax   = TOV(eos=sly_eos, ode_backend="jax")
-
-        M_s, R_s, C_s = tov_scipy.solve(central_pressure)
-        M_j, R_j, C_j = tov_jax.solve(central_pressure)
-
-        assert abs(M_s - M_j) / M_s < REL_TOL, (
-            f"Mass disagreement: scipy={M_s:.6g}, jax={M_j:.6g}"
+        jax.config.update("jax_enable_x64", True)
+        tov = TOV(eos=sly, leven=[2, 3], lodd=[2])
+        y0, h0, _ = tov._TOV__initial_data(PC, dh_fact=-1e-3)
+        dy_np = tov.equations(h0, y0, tov._tables, np)
+        dy_jax = tov.equations(
+            h0, jnp.asarray(y0), tuple(map(jnp.asarray, tov._tables)), jnp
         )
-        assert abs(R_s - R_j) / R_s < REL_TOL, (
-            f"Radius disagreement: scipy={R_s:.6g}, jax={R_j:.6g}"
-        )
-        assert abs(C_s - C_j) / C_s < REL_TOL, (
-            f"Compactness disagreement: scipy={C_s:.6g}, jax={C_j:.6g}"
-        )
+        np.testing.assert_allclose(np.asarray(dy_jax), dy_np, rtol=1e-12)
+
+    def test_hashable(self):
+        assert hash(TOVEquations((2,), ())) == hash(TOVEquations((2,), ()))
 
 
-# ---------------------------------------------------------------------------
-# Backend agreement on TOV equations (M, R, C)
-# ---------------------------------------------------------------------------
-
-class TestTOVBackendConsistency:
-    """ScipySolver and NumbaSolver must agree to within tolerances."""
-
-    REL_TOL = 1e-4  # 0.01% relative tolerance
-
-    def test_mass_radius_compactness(self, sly_eos, central_pressure):
-        tov_scipy = TOV(eos=sly_eos, ode_backend="scipy")
-        tov_numba = TOV(eos=sly_eos, ode_backend="numba")
-
-        M_s, R_s, C_s = tov_scipy.solve(central_pressure)
-        M_n, R_n, C_n = tov_numba.solve(central_pressure)
-
-        assert abs(M_s - M_n) / M_s < self.REL_TOL, (
-            f"Mass disagreement: scipy={M_s:.6g}, numba={M_n:.6g}"
-        )
-        assert abs(R_s - R_n) / R_s < self.REL_TOL, (
-            f"Radius disagreement: scipy={R_s:.6g}, numba={R_n:.6g}"
-        )
-        assert abs(C_s - C_n) / C_s < self.REL_TOL, (
-            f"Compactness disagreement: scipy={C_s:.6g}, numba={C_n:.6g}"
-        )
-
-    def test_tov_scipy_default_backend(self, sly_eos, central_pressure):
-        """Default backend must be scipy and produce a physical star."""
-        tov = TOV(eos=sly_eos)
-        assert isinstance(tov.solver, ScipySolver)
-        M, R, C = tov.solve(central_pressure)
-        assert M > 0
-        assert R > 0
-        assert 0 < C < 0.5
-
-    def test_tov_custom_instance(self, sly_eos, central_pressure):
-        """Passing a pre-built solver instance must work."""
-        custom = ScipySolver(method="RK45")
-        tov = TOV(eos=sly_eos, ode_backend=custom)
-        assert tov.solver is custom
-        M, R, C = tov.solve(central_pressure)
-        assert M > 0
+TIGHT = dict(ode_rtol=1e-10, ode_atol=1e-10)
 
 
-# ---------------------------------------------------------------------------
-# Even-parity tidal parameters (k[2], h[2])
-# ---------------------------------------------------------------------------
+class TestBackendAgreement:
+    """The backends and solve/solve_many solve the same equations, so at tight
+    tolerance they agree to far better than the tolerance. At the default
+    tolerances they differ by about the integration error, as any two step
+    sequences do."""
 
-class TestEvenTidal:
-    """Tests for the ell=2 even-parity Love/shape numbers."""
+    @needs_jax
+    @pytest.mark.parametrize("eos_name", ["sly", "sfho"])
+    def test_scipy_and_jax(self, eos_name, request):
+        eos = request.getfixturevalue(eos_name)
+        pcs = PCS if eos_name == "sfho" else [PC]
+        out = {
+            b: np.array(
+                [
+                    _love(r)
+                    for r in TOV(
+                        eos=eos, leven=[2], lodd=[2], ode_backend=b, **TIGHT
+                    ).solve_many(pcs)
+                ]
+            )
+            for b in ("scipy", "jax")
+        }
+        np.testing.assert_allclose(out["jax"], out["scipy"], rtol=2e-6)
 
-    REL_TOL = 2e-3  # 0.2% — consistent with ode_atol/rtol=1e-6
+    @pytest.mark.parametrize("backend", BACKENDS)
+    def test_solve_and_solve_many(self, backend, sfho):
+        tov = TOV(eos=sfho, leven=[2], lodd=[2], ode_backend=backend, **TIGHT)
+        one = np.array([_love(tov.solve(pc)) for pc in PCS])
+        many = np.array([_love(r) for r in tov.solve_many(PCS)])
+        np.testing.assert_allclose(many, one, rtol=1e-6)
+
+    def test_trajectory_ends_at_surface(self, sly):
+        tov = TOV(eos=sly)
+        M, R, C = tov.solve(PC)
+        assert tov.sol.t[-1] == 0.0
+        assert tov.sol.y[tov.var["r"], -1] == R
+        assert tov.sol.y[tov.var["nu"], -1] == pytest.approx(np.log(1 - 2 * M / R))
+
+
+class TestAccuracy:
+    """At the default tolerances, Lambda of a tabulated EOS stays within 1e-3
+    of a 1e-11 reference. Lambda is what a loose tolerance gets wrong first."""
 
     @pytest.fixture(scope="class")
-    def even_tov_scipy(self, sly_eos):
-        return TOV(eos=sly_eos, leven=[2], ode_backend="scipy")
+    def reference(self, sfho):
+        tov = TOV(
+            eos=sfho, leven=[2], ode_backend="scipy", ode_rtol=1e-11, ode_atol=1e-11
+        )
+        return np.array(
+            [tov.Compute_Lambda(2, r[3][2], r[2]) for r in tov.solve_many(PCS)]
+        )
 
-    @pytest.fixture(scope="class")
-    def even_tov_numba(self, sly_eos):
-        return TOV(eos=sly_eos, leven=[2], ode_backend="numba")
+    @pytest.mark.parametrize("backend", BACKENDS)
+    def test_lambda(self, backend, sfho, reference):
+        tov = TOV(eos=sfho, leven=[2], ode_backend=backend)
+        lam = np.array(
+            [tov.Compute_Lambda(2, r[3][2], r[2]) for r in tov.solve_many(PCS)]
+        )
+        np.testing.assert_allclose(lam, reference, rtol=1e-3)
 
-    def test_even_tidal_scipy_physical(self, even_tov_scipy, central_pressure):
-        """k[2] and h[2] must be positive and in physically reasonable range."""
-        M, R, C, k, h = even_tov_scipy.solve(central_pressure)
-        assert M > 0 and R > 0
-        assert k[2] > 0, f"Even Love number k[2]={k[2]} must be positive"
-        assert h[2] > 0, f"Shape number h[2]={h[2]} must be positive"
-        # For typical NS k2 is O(0.01-0.15); h2 is O(0.1-10)
-        assert k[2] < 1.0, f"k[2]={k[2]} seems unphysically large"
 
-    def test_even_tidal_backend_consistency(
-        self, even_tov_scipy, even_tov_numba, central_pressure
+class _NeverReaches(ODESolver):
+    """A backend whose integrations all stop short of the surface."""
+
+    def integrate(
+        self, rhs, args, t0, t1, y0, first_step, rtol, atol, trajectory=False
     ):
-        """scipy and numba must agree on k[2] and h[2]."""
-        M_s, R_s, C_s, k_s, h_s = even_tov_scipy.solve(central_pressure)
-        M_n, R_n, C_n, k_n, h_n = even_tov_numba.solve(central_pressure)
+        y = np.asarray(y0, dtype=float)
+        return t0, y, False, None
 
-        assert abs(k_s[2] - k_n[2]) / abs(k_s[2]) < self.REL_TOL, (
-            f"k[2] disagreement: scipy={k_s[2]:.6g}, numba={k_n[2]:.6g}"
+
+class TestFailure:
+    def test_stopping_short_gives_nan(self, sly):
+        tov = TOV(eos=sly, leven=[2], lodd=[2], ode_backend=_NeverReaches())
+        assert np.all(np.isnan(_love(tov.solve(PC))))
+        assert all(np.all(np.isnan(_love(r))) for r in tov.solve_many(PCS))
+
+    @needs_jax
+    def test_jax_max_steps(self, sly):
+        tov = TOV(eos=sly, leven=[2], ode_backend=JaxSolver(max_steps=5))
+        M, R, C, k, h = tov.solve_many([PC])[0]
+        assert np.isnan(M) and np.isnan(k[2])
+
+
+class TestDefaults:
+    def test_tolerances(self, sly):
+        tov = TOV(eos=sly)
+        assert (tov.ode_rtol, tov.ode_atol) == (1e-8, 1e-8)
+
+    def test_methods(self, sly):
+        assert TOV(eos=sly).solver.method == "DOP853"
+
+    @needs_jax
+    def test_jax_method(self, sly):
+        assert TOV(eos=sly, ode_backend="jax").solver.method == "Dopri5"
+
+
+class TestTabularVectorised:
+    """An array gives the same values as the same points one by one, below,
+    inside and above the table."""
+
+    @pytest.mark.parametrize(
+        "method, lo, hi",
+        [
+            ("Pressure_Of_PseudoEnthalpy", -30, 1),
+            ("EnergyDensity_Of_PseudoEnthalpy", -30, 1),
+            ("PseudoEnthalpy_Of_Pressure", -30, -5),
+            ("EnergyDensity_Of_Pressure", -30, -5),
+            ("EnergyDensityDeriv_Of_Pressure", -30, -5),
+        ],
+    )
+    def test_array_equals_scalar(self, sfho, method, lo, hi):
+        f = getattr(sfho, method)
+        x = np.logspace(lo, hi, 400)
+        np.testing.assert_array_equal(f(x), [f(v) for v in x])
+        assert np.isscalar(f(x[200])) or np.ndim(f(x[200])) == 0
+
+
+class TestLoveSmallCompactness:
+    """The l = 2 Love number at small compactness, where the closed form
+    cancels catastrophically."""
+
+    @staticmethod
+    def _closed_form(c, y, log=np.log):
+        nk = (1 - 2 * c) ** 2 * (2 + 2 * c * (y - 1) - y)
+        dk = (
+            2 * c * (6 - 3 * y + 3 * c * (5 * y - 8))
+            + 4 * c**3 * (13 - 11 * y + c * (3 * y - 2) + 2 * c**2 * (1 + y))
+            + 3 * (1 - 2 * c) ** 2 * (2 - y + 2 * c * (y - 1)) * log(1 - 2 * c)
         )
-        assert abs(h_s[2] - h_n[2]) / abs(h_s[2]) < self.REL_TOL, (
-            f"h[2] disagreement: scipy={h_s[2]:.6g}, numba={h_n[2]:.6g}"
-        )
+        return 8 * c**5 / 5 * nk / dk
 
+    @pytest.mark.parametrize("y", [0.5, 1.5, 2.5])
+    def test_exact(self, y):
+        mp = pytest.importorskip("mpmath")
+        from tovpy.tov import _k2_small_compactness
 
-# ---------------------------------------------------------------------------
-# Odd-parity tidal parameters (j[2])
-# ---------------------------------------------------------------------------
+        mp.mp.dps = 50
+        for c in (1e-6, 1e-4, 1e-3, 1e-2, 0.03):
+            exact = float(self._closed_form(mp.mpf(c), mp.mpf(y), log=mp.log))
+            assert _k2_small_compactness(c, y) == pytest.approx(exact, rel=1e-13)
 
-class TestOddTidal:
-    """Tests for the ell=2 odd-parity Love numbers."""
+    @pytest.mark.parametrize("y", [0.5, 1.5, 2.5])
+    def test_joins_closed_form(self, y):
+        from tovpy.tov import _k2_small_compactness
 
-    REL_TOL = 2e-3  # 0.2% — consistent with ode_atol/rtol=1e-6
-
-    @pytest.fixture(scope="class")
-    def odd_tov_scipy(self, sly_eos):
-        return TOV(eos=sly_eos, lodd=[2], ode_backend="scipy")
-
-    @pytest.fixture(scope="class")
-    def odd_tov_numba(self, sly_eos):
-        return TOV(eos=sly_eos, lodd=[2], ode_backend="numba")
-
-    def test_odd_tidal_scipy_physical(self, odd_tov_scipy, central_pressure):
-        """j[2] must be nonzero and in physically reasonable magnitude range."""
-        M, R, C, j = odd_tov_scipy.solve(central_pressure)
-        assert M > 0 and R > 0
-        assert j[2] != 0, "Odd Love number j[2] must be nonzero"
-        assert abs(j[2]) < 1.0, f"|j[2]|={abs(j[2])} seems unphysically large"
-
-    def test_odd_tidal_backend_consistency(
-        self, odd_tov_scipy, odd_tov_numba, central_pressure
-    ):
-        """scipy and numba must agree on j[2]."""
-        M_s, R_s, C_s, j_s = odd_tov_scipy.solve(central_pressure)
-        M_n, R_n, C_n, j_n = odd_tov_numba.solve(central_pressure)
-
-        assert abs(j_s[2] - j_n[2]) / abs(j_s[2]) < self.REL_TOL, (
-            f"j[2] disagreement: scipy={j_s[2]:.6g}, numba={j_n[2]:.6g}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Combined even + odd tidal parameters
-# ---------------------------------------------------------------------------
-
-class TestCombinedTidal:
-    """TOV with both even and odd perturbations active simultaneously."""
-
-    @pytest.fixture(scope="class")
-    def combined_tov(self, sly_eos):
-        return TOV(eos=sly_eos, leven=[2], lodd=[2], ode_backend="scipy")
-
-    def test_combined_returns_all_outputs(self, combined_tov, central_pressure):
-        """With both leven and lodd set, solve() returns (M, R, C, k, h, j)."""
-        result = combined_tov.solve(central_pressure)
-        assert len(result) == 6, (
-            f"Expected 6-tuple (M,R,C,k,h,j), got {len(result)}-tuple"
-        )
-        M, R, C, k, h, j = result
-        assert M > 0 and R > 0
-        assert k[2] > 0
-        assert h[2] > 0
-        assert j[2] != 0
-
-
-# ---------------------------------------------------------------------------
-# Solver speed benchmark (informational -- never fails)
-# ---------------------------------------------------------------------------
-
-class TestSolverBenchmark:
-    """
-    Benchmark all three backends on the full TOV equations and print the
-    results.  These tests always pass; they exist to report timing information.
-    """
-
-    N_WARMUP = 2
-    N_BENCH = 10
-
-    def _time_backend(self, backend_name, sly_eos, pc):
-        tov = TOV(eos=sly_eos, ode_backend=backend_name)
-        for _ in range(self.N_WARMUP):
-            tov.solve(pc)
-        t0 = time.perf_counter()
-        for _ in range(self.N_BENCH):
-            tov.solve(pc)
-        return (time.perf_counter() - t0) / self.N_BENCH
-
-    def test_benchmark_scipy(self, sly_eos, central_pressure):
-        t = self._time_backend("scipy", sly_eos, central_pressure)
-        print(f"\n[benchmark] scipy  : {t * 1000:.2f} ms/call")
-
-    def test_benchmark_numba(self, sly_eos, central_pressure):
-        t = self._time_backend("numba", sly_eos, central_pressure)
-        print(f"\n[benchmark] numba  : {t * 1000:.2f} ms/call")
-
-    @pytest.mark.skipif(not _jax_diffrax_available(), reason="jax/diffrax not installed")
-    def test_benchmark_jax(self, sly_eos, central_pressure):
-        t = self._time_backend("jax", sly_eos, central_pressure)
-        print(f"\n[benchmark] jax    : {t * 1000:.2f} ms/call")
-
-    @pytest.mark.skipif(not _jax_diffrax_available(), reason="jax/diffrax not installed")
-    def test_benchmark_jax_sequence(self, sly_eos):
-        """JAX sequence benchmark: solving for varying central pressures must be
-        fast after JIT warmup (no re-tracing per call)."""
-        pc_array = np.logspace(-12, -9, 20)
-        tov = TOV(eos=sly_eos, ode_backend="jax")
-        # Warmup: first call triggers JIT compilation
-        tov.solve(pc_array[0])
-        tov.solve(pc_array[-1])
-
-        t0 = time.perf_counter()
-        for pc in pc_array:
-            tov.solve(pc)
-        elapsed = time.perf_counter() - t0
-        ms_per_solve = elapsed / len(pc_array) * 1000
-        print(
-            f"\n[benchmark] jax seq: {elapsed:.3f}s total, "
-            f"{ms_per_solve:.2f} ms/solve ({len(pc_array)} pressures)"
-        )
-        # After JIT compilation, JAX solves with varying inputs should average
-        # no more than 50 ms each (well below the ~800 ms re-tracing penalty).
-        assert ms_per_solve < 50, (
-            f"JAX sequence too slow: {ms_per_solve:.1f} ms/solve; "
-            f"expected <50 ms after JIT compilation"
+        # at c = 0.03 the closed form is still good to ~3e-10
+        c = 0.03
+        assert _k2_small_compactness(c, y) == pytest.approx(
+            self._closed_form(c, y), rel=1e-8
         )
 
-    @pytest.mark.skipif(not _jax_diffrax_available(), reason="jax/diffrax not installed")
-    def test_benchmark_jax_eos_change(self, sly_eos):
-        """JAX EOS-change benchmark: switching EOS must reuse the compiled
-        kernel (no recompilation) as long as the structural layout matches."""
-        eos_names = ["SLy", "AP1", "FPS", "WFF1", "BBB2",
-                     "ENG", "MPA1", "MS1", "ALF2", "H4"]
-        pc_array = np.logspace(-12, -9, 20)
+    @pytest.mark.parametrize("y", [0.5, 1.5, 2.5])
+    def test_newtonian_limit(self, y):
+        from tovpy.tov import _k2_small_compactness
 
-        # Warmup: compile the kernel with the first EOS
-        tov_warmup = TOV(eos=sly_eos, ode_backend="jax")
-        tov_warmup.solve(pc_array[0])
-        tov_warmup.solve(pc_array[-1])
-
-        # Benchmark subsequent EOS — should all hit the cached kernel
-        times = {}
-        for name in eos_names[1:]:
-            eos = EOSPiecewisePolytropic(name)
-            tov = TOV(eos=eos, ode_backend="jax")
-            t0 = time.perf_counter()
-            for pc in pc_array:
-                tov.solve(pc)
-            times[name] = time.perf_counter() - t0
-
-        total = sum(times.values())
-        ms_per_solve = total / (len(eos_names[1:]) * len(pc_array)) * 1000
-        print(
-            f"\n[benchmark] jax EOS change: {total:.3f}s total, "
-            f"{ms_per_solve:.2f} ms/solve ({len(eos_names[1:])} EOS × "
-            f"{len(pc_array)} pressures)"
-        )
-        for name, t in times.items():
-            print(f"  {name}: {t:.3f}s ({t/len(pc_array)*1000:.1f} ms/solve)")
-
-        # After warmup, switching EOS should not trigger recompilation.
-        # 50 ms/solve is generous (actual ~5 ms); catches the ~800 ms
-        # re-tracing regression.
-        assert ms_per_solve < 50, (
-            f"JAX EOS change too slow: {ms_per_solve:.1f} ms/solve; "
-            f"expected <50 ms (compiled kernel should be reused across EOS)"
-        )
-
-    def test_benchmark_rhs_interpolation(self, sly_eos, central_pressure):
-        """
-        Compare the optimized RHS (pre-built tables + np.interp) against a
-        reference that calls Python EOS methods directly.  The optimized path
-        should be equal or faster; with Numba it is significantly faster.
-        """
-        tov = TOV(eos=sly_eos)
-        eos = sly_eos
-        pc = central_pressure
-        hc = eos.PseudoEnthalpy_Of_Pressure(pc)
-        h_test = hc * 0.5
-
-        N = 10_000
-
-        t0 = time.perf_counter()
-        for _ in range(N):
-            eos.Pressure_Of_PseudoEnthalpy(h_test)
-            eos.EnergyDensity_Of_PseudoEnthalpy(h_test)
-            eos.EnergyDensityDeriv_Of_Pressure(eos.Pressure_Of_PseudoEnthalpy(h_test))
-        t_eos = (time.perf_counter() - t0) / N * 1e6
-
-        lh = np.log(h_test)
-        t0 = time.perf_counter()
-        for _ in range(N):
-            p = np.exp(np.interp(lh, tov._log_h, tov._log_p))
-            np.exp(np.interp(lh, tov._log_h, tov._log_e))
-            np.exp(np.interp(np.log(p), tov._log_p_sorted, tov._log_dedp))
-        t_tables = (time.perf_counter() - t0) / N * 1e6
-
-        print(
-            f"\n[benchmark] RHS EOS evaluation:"
-            f" Python methods={t_eos:.2f} us,"
-            f" pre-built tables (np.interp)={t_tables:.2f} us"
-        )
-        MAX_SLOWDOWN_FACTOR = 3
-        assert t_tables < t_eos * MAX_SLOWDOWN_FACTOR, (
-            f"Table interpolation ({t_tables:.2f} us) is unexpectedly slow "
-            f"vs Python EOS ({t_eos:.2f} us)"
-        )
+        # k2 -> (2 - y) / (2 (y + 3)) with a correction linear in c
+        k = _k2_small_compactness(1e-8, y)
+        assert k == pytest.approx((2 - y) / (2 * (y + 3)), rel=1e-6)

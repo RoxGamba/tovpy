@@ -44,8 +44,8 @@ class Utils:
             Path to the directory where data will be saved. If None, uses the current working directory.
         ode_backend : str or ODESolver, optional
             ODE solver backend forwarded to every :class:`~tovpy.tov.TOV` instance
-            created by this utility.  One of ``'scipy'`` (default), ``'numba'``,
-            ``'jax'``, or a pre-built :class:`~tovpy.solvers.ODESolver`.
+            created by this utility.  One of ``'scipy'`` (default), ``'jax'``,
+            or a pre-built :class:`~tovpy.solvers.ODESolver`.
         """
         self.path = path if path else os.getcwd()
         if not os.path.exists(self.path):

@@ -15,50 +15,101 @@ You should have received a copy of the GNU General Public License
 along with this program. If not, see <https://www.gnu.org/licenses/>.
 """
 
+from dataclasses import dataclass
+
 import numpy as np
+from numpy.polynomial import Polynomial
 from scipy.special import factorial2, gamma, hyp2f1, poch
 from math import comb, prod
 
-from .solvers import JaxSolver, make_solver
-
-# ---------------------------------------------------------------------------
-# Optional Numba JIT — transparent no-op fallback if not installed
-# ---------------------------------------------------------------------------
-try:
-    from numba import njit as _njit
-
-    _NUMBA_AVAILABLE = True
-except ImportError:
-
-    def _njit(*args, **kwargs):
-        if len(args) == 1 and callable(args[0]):
-            return args[0]
-
-        def decorator(fn):
-            return fn
-
-        return decorator
-
-    _NUMBA_AVAILABLE = False
+from .solvers import SolverResult, make_solver
 
 
-@_njit(cache=True)
-def _interp_positive(val, x_table, y_table):
+def _evaluate(f, x):
+    """Evaluate f on the array x, in one call if f takes arrays, else point by
+    point."""
+    try:
+        y = np.asarray(f(x), dtype=float)
+        if y.shape == x.shape:
+            return y
+    except (TypeError, ValueError):
+        pass
+    return np.array([f(v) for v in x])
+
+
+def _k2_small_compactness(c, y, terms=30):
+    """Even-parity l = 2 Love number for compactness c < 0.03.
+
+    The closed form divides two quantities of order c^5 and loses all precision
+    below c ~ 3e-4. Expanding log(1 - 2c) in its denominator as a power series
+    makes the terms below c^5 cancel exactly, so c^5 divides out and the result
+    is exact to rounding."""
+    poly = Polynomial(
+        [
+            0,
+            2 * (6 - 3 * y),
+            6 * (5 * y - 8),
+            4 * (13 - 11 * y),
+            4 * (3 * y - 2),
+            8 * (1 + y),
+        ]
+    )
+    q = 3 * Polynomial([1, -4, 4]) * Polynomial([2 - y, 2 * (y - 1)])
+    log = Polynomial([0] + [-(2.0**n) / n for n in range(1, terms + 1)])
+    dk_over_c5 = Polynomial((poly + q * log).coef[5:])(c)
+    nk = (1 - 2 * c) ** 2 * (2 + 2 * c * (y - 1) - y)
+    return 8 / 5 * nk / dk_over_c5
+
+
+@dataclass(frozen=True)
+class TOVEquations:
+    """r.h.s. of the TOV equations in the pseudo-enthalpy h, with the even- and
+    odd-parity stationary perturbations of multipoles ``leven``, ``lodd``. It uses
+    only the array module ``xp``, so numpy and jax.numpy share one
+    implementation.
+
+    The state is r, m, nu, then (H_l, dH_l) for each even l, then (Psi_l, dPsi_l)
+    for each odd l. ``tables`` are the EOS log tables of
+    :meth:`TOV._build_eos_tables`.
+
+    Lindblom, Astrophys. J. 398, 569 (1992), Eqs. (5)-(6); Damour & Nagar,
+    Phys. Rev. D 80, 084035 (2009), Eqs. (18), (27)-(29), (31).
     """
-    Log-log linear interpolation on a strictly positive, monotonically
-    increasing *x_table* (stored as log values).  Both *val* and all table
-    entries must be > 0.
-    """
-    lv = np.log(val)
-    lo, hi = 0, len(x_table) - 1
-    while hi - lo > 1:
-        mid = (lo + hi) >> 1
-        if x_table[mid] <= lv:
-            lo = mid
-        else:
-            hi = mid
-    t = (lv - x_table[lo]) / (x_table[hi] - x_table[lo])
-    return np.exp(y_table[lo] + t * (y_table[hi] - y_table[lo]))
+
+    leven: tuple = ()
+    lodd: tuple = ()
+
+    def __call__(self, h, y, tables, xp):
+        log_h, log_p, log_e, log_p_sorted, log_dedp = tables
+        lh = xp.log(h)
+        p = xp.exp(xp.interp(lh, log_h, log_p))
+        e = xp.exp(xp.interp(lh, log_h, log_e))
+        dedp = xp.exp(xp.interp(xp.log(p), log_p_sorted, log_dedp))
+
+        r, m = y[0], y[1]
+        pi = np.pi
+        dr_dh = -r * (r - 2.0 * m) / (m + 4.0 * pi * r**3 * p)
+        dnu_dr = 2.0 * (m + 4.0 * pi * r**3 * p) / (r * (r - 2.0 * m))
+        exp_lam = 1.0 / (1.0 - 2.0 * m / r)
+        dy = [dr_dh, 4.0 * pi * r**2 * e * dr_dh, dnu_dr * dr_dh]
+
+        i = 3
+        if self.leven:
+            C1 = 2.0 / r + exp_lam * (2.0 * m / r**2 + 4.0 * pi * r * (p - e))
+            source = 4.0 * pi * (5.0 * e + 9.0 * p + (e + p) * dedp)
+        for l in self.leven:
+            C0 = -(dnu_dr**2) + exp_lam * (source - l * (l + 1) / r**2)
+            H, dH = y[i], y[i + 1]
+            dy += [dH * dr_dh, -(C0 * H + C1 * dH) * dr_dh]
+            i += 2
+        if self.lodd:
+            C1 = exp_lam * (2.0 * m + 4.0 * pi * r**3 * (p - e)) / r**2
+        for l in self.lodd:
+            C0 = exp_lam * (-l * (l + 1) / r**2 + 6.0 * m / r**3 - 4.0 * pi * (e - p))
+            Psi, dPsi = y[i], y[i + 1]
+            dy += [dPsi * dr_dh, -(C0 * Psi + C1 * dPsi) * dr_dh]
+            i += 2
+        return xp.stack(dy)
 
 
 class TOV(object):
@@ -72,7 +123,7 @@ class TOV(object):
 
     Works in geometric units.
 
-    Reference codes:
+    Reference codes
 
     * https://lscsoft.docs.ligo.org/lalsuite/lalsimulation/_l_a_l_sim_neutron_star_t_o_v_8c_source.html
     * https://bitbucket.org/bernuzzi/tov/src/master/TOVL.m
@@ -84,35 +135,35 @@ class TOV(object):
         Equation of state instance.
     leven : list of int
         Multipole indices for even-parity perturbations (Love numbers k, h).
-        Values must be > 1; values <= 1 are silently dropped.
+        The solver ignores values <= 1.
     lodd : list of int
         Multipole indices for odd-parity perturbations (Love numbers j).
-        Values must be > 1; values <= 1 are silently dropped.
+        The solver ignores values <= 1.
     dhfact : float
         Initial ODE step factor (must be negative, default ``-1e-12``).
-    ode_method : str
-        Integration method forwarded to ``ScipySolver`` / ``solve_ivp``
-        (e.g. ``'DOP853'``, ``'RK45'``).  Ignored for ``'numba'`` and
-        ``'jax'`` backends.
+    ode_method : str or None
+        Integration method. On ``'scipy'``, any ``solve_ivp`` method (default
+        ``'DOP853'``). On ``'jax'``, a diffrax solver name or a scipy name, which
+        picks the diffrax method of the same order (default ``'Dopri5'``).
+        ``Dopri5`` is the fastest on JAX. ``'DOP853'`` (``Dopri8``) takes fewer
+        steps but costs about four times as much per star.
     ode_atol : float
-        Absolute ODE tolerance (default ``1e-6``).
+        Absolute ODE tolerance (default ``1e-8``).
     ode_rtol : float
-        Relative ODE tolerance (default ``1e-6``).
+        Relative ODE tolerance (default ``1e-8``). At ``1e-6`` the tidal
+        deformability of a tabulated EOS with sharp features can be off by tens
+        of percent. At ``1e-8`` it stays within ~1e-4.
     ode_backend : str or ODESolver
-        ODE solver backend.  Accepts:
+        ODE solver backend, one of
 
-        * ``'scipy'`` (default) — wraps :func:`scipy.integrate.solve_ivp`;
-          ``ode_method`` selects the algorithm.
-        * ``'numba'`` — pure-NumPy adaptive Dormand-Prince RK45; independent
-          of scipy; structured for future Numba JIT once the EOS layer is
-          numba-compatible.
-        * ``'jax'`` — JAX/diffrax Dopri5 with a fully XLA-JIT-compiled native
-          RHS; ~3× faster than scipy after one-time JIT compilation warmup;
-          requires ``pip install "jax[cpu]" diffrax``.
+        * ``'scipy'`` (default), :func:`scipy.integrate.solve_ivp`.
+        * ``'jax'``, diffrax, compiled by JAX. :meth:`solve_many` solves all
+          central pressures in one kernel. Requires
+          ``pip install "jax[cpu]" diffrax``.
         * A pre-instantiated :class:`~tovpy.solvers.ODESolver` instance
           (e.g. ``make_solver('scipy', method='RK45')``).
     eos_table_points : int
-        Number of points to pre-sample the EOS for fast interpolation (default 2000).
+        Number of EOS samples the r.h.s. interpolates (default 2000).
 
     Examples
     --------
@@ -128,7 +179,6 @@ class TOV(object):
 
     Alternative backends::
 
-        tov_numba = TOV(eos=eos, ode_backend='numba')
         tov_jax   = TOV(eos=eos, ode_backend='jax')
         tov_rk45  = TOV(eos=eos, ode_backend=make_solver('scipy', method='RK45'))
     """
@@ -139,9 +189,9 @@ class TOV(object):
         leven=[],
         lodd=[],
         dhfact=-1e-12,
-        ode_method="DOP853",
-        ode_atol=1e-6,
-        ode_rtol=1e-6,
+        ode_method=None,
+        ode_atol=1e-8,
+        ode_rtol=1e-8,
         ode_backend="scipy",
         eos_table_points=2000,
     ):
@@ -168,10 +218,12 @@ class TOV(object):
         self.ode_atol = ode_atol
         self.ode_rtol = ode_rtol
 
-        if ode_backend == "scipy":
-            self.solver = make_solver("scipy", method=ode_method)
-        else:
-            self.solver = make_solver(ode_backend)
+        self.solver = make_solver(
+            ode_backend, **({} if ode_method is None else {"method": ode_method})
+        )
+        self.equations = TOVEquations(
+            tuple(int(l) for l in self.leven), tuple(int(l) for l in self.lodd)
+        )
 
         self._i_r = self.var["r"]
         self._i_m = self.var["m"]
@@ -185,17 +237,6 @@ class TOV(object):
         ]
 
         self._build_eos_tables(n_points=eos_table_points)
-
-        self._update_even = (
-            self._apply_even_perts
-            if len(self.leven)
-            else lambda dy, y, m, r, p, e, dedp, dr_dh, dnu_dr: None
-        )
-        self._update_odd = (
-            self._apply_odd_perts
-            if len(self.lodd)
-            else lambda dy, y, m, r, p, e, dedp, dr_dh: None
-        )
 
     def __buildvars(self):
         """
@@ -211,45 +252,16 @@ class TOV(object):
         return v
 
     def _build_eos_tables(self, n_points=2000):
-        """Pre-sample the EOS once at construction and store log-space 1-D arrays
-        for use in the fast RHS interpolation path.
+        """Sample the EOS once, in log space, over every pseudo-enthalpy a
+        solve can reach, so the r.h.s. only interpolates.
 
-        Tables stored (all 1-D, contiguous, float64):
-          _log_h        : log(h) values (sorted ascending)
-          _log_p        : log(p) values (same ordering as h)
-          _log_e        : log(e) values
-          _log_p_sorted : log(p) sorted ascending (key for dedp lookup)
-          _log_dedp     : log(dedp) values, sorted by ascending log(p)
-
-        Also binds ``self._eos_eval(h) -> (p, e, dedp)`` once, choosing the
-        Numba JIT path or the ``np.interp`` path depending on availability.
+        ``self._tables`` holds log h, log p and log e ordered by h, then log p
+        and log de/dp ordered by p.
         """
-        # Sample in h, the integration variable, across every value a solve can
-        # visit -- so the RHS only ever *interpolates*.
-        #
-        # This used to sample in p across a fixed 1e-19..1e-8 box (it read
-        # `self.eos.p_min`/`p_max`, names no EOS class defines, so the lookup
-        # raised AttributeError every time and the box was never a choice
-        # anyone made). Whatever box you pick, the solve still runs out to the
-        # surface, h -> 0, below any finite floor: measured on a catalogue EOS,
-        # every solve asked for h up to 8.5 decades under the grid. Those
-        # queries were answered by continuing one straight line in log-log
-        # through the grid's two lowest points -- exact only where that region
-        # happens to be a true power law, and different between the
-        # scipy/numba and jax paths, which is why they could disagree about
-        # Mmax by 9%.
-        #
-        # Bounds, both known in advance rather than guessed:
-        #  * top -- a solve starts at h(pc), and pc can reach past the table
-        #    into the ultra-relativistic extension, so keep the old 1e-8
-        #    headroom.
-        #  * bottom -- `solve` integrates down to `|dhfact| * h(pc)` exactly,
-        #    never below, so the lowest reachable h is `|dhfact|` times the
-        #    smallest h any pc could give. Two further decades for safety.
-        #
-        # Every sample is taken by *calling the EOS*, so its own low- and
-        # high-density power-law continuations get tabulated faithfully
-        # instead of being re-derived from the grid's edge slope.
+        # A solve with central pressure pc stops at |dhfact| h(pc). The grid runs
+        # from h(p_hi), above any central pressure, down to 1e-2 |dhfact| h(p_lo),
+        # below every stopping point. Sampling the EOS itself keeps its
+        # power-law continuations off the table.
         p_lo, p_hi = 1e-19, 1e-8
         try:
             p_lo = min(p_lo, float(self.eos.p_min) * 1.001)
@@ -264,9 +276,9 @@ class TOV(object):
         )
 
         h_arr = np.logspace(np.log10(h_lo), np.log10(h_hi), n_points)
-        p_arr = np.array([self.eos.Pressure_Of_PseudoEnthalpy(h) for h in h_arr])
-        e_arr = np.array([self.eos.EnergyDensity_Of_PseudoEnthalpy(h) for h in h_arr])
-        dedp_arr = np.array([self.eos.EnergyDensityDeriv_Of_Pressure(p) for p in p_arr])
+        p_arr = _evaluate(self.eos.Pressure_Of_PseudoEnthalpy, h_arr)
+        e_arr = _evaluate(self.eos.EnergyDensity_Of_PseudoEnthalpy, h_arr)
+        dedp_arr = _evaluate(self.eos.EnergyDensityDeriv_Of_Pressure, p_arr)
 
         valid = (h_arr > 0) & (e_arr > 0) & (dedp_arr > 0) & (p_arr > 0)
         h_arr = h_arr[valid]
@@ -280,258 +292,14 @@ class TOV(object):
         e_arr = e_arr[idx]
         dedp_arr = dedp_arr[idx]
 
-        self._log_h = np.ascontiguousarray(np.log(h_arr))
-        self._log_p = np.ascontiguousarray(np.log(p_arr))
-        self._log_e = np.ascontiguousarray(np.log(e_arr))
-
-        # dedp keyed by pressure
         p_idx = np.argsort(p_arr)
-        self._log_p_sorted = np.ascontiguousarray(np.log(p_arr[p_idx]))
-        self._log_dedp = np.ascontiguousarray(np.log(dedp_arr[p_idx]))
-
-        log_h = self._log_h
-        log_p = self._log_p
-        log_e = self._log_e
-        log_p_sorted = self._log_p_sorted
-        log_dedp = self._log_dedp
-
-        if _NUMBA_AVAILABLE:
-
-            def _eos_eval(h):
-                p = _interp_positive(h, log_h, log_p)
-                e = _interp_positive(h, log_h, log_e)
-                dedp = _interp_positive(p, log_p_sorted, log_dedp)
-                return p, e, dedp
-
-        else:
-
-            def _eos_eval(h):
-                lh = np.log(h)
-                p = np.exp(np.interp(lh, log_h, log_p))
-                e = np.exp(np.interp(lh, log_h, log_e))
-                dedp = np.exp(np.interp(np.log(p), log_p_sorted, log_dedp))
-                return p, e, dedp
-
-        self._eos_eval = _eos_eval
-
-    def _get_jax_rhs(self):
-        """Return a native JAX RHS, building and caching it on first call.
-
-        Returns ``None`` if JAX is not installed.  The returned function has
-        signature ``jax_rhs(h, y, eos_tables)`` where *eos_tables* is a tuple
-        of five ``jnp`` arrays ``(log_h, log_p, log_e, log_p_sorted,
-        log_dedp)``.  Passing the EOS data as an argument (rather than closing
-        over it) allows a single JIT-compiled kernel to be reused across
-        different EOS instances that share the same structural layout and table
-        size — see :meth:`_get_jax_structural_key`.
-        """
-        if not hasattr(self, "_jax_rhs_cached"):
-            self._jax_rhs_cached = self._build_jax_rhs()
-        return self._jax_rhs_cached
-
-    def _get_jax_eos_tables(self):
-        """Return the pre-built EOS tables as a tuple of ``jnp`` arrays.
-
-        Returns ``None`` if JAX is not installed.
-        """
-        try:
-            import jax.numpy as jnp
-        except ImportError:
-            return None
-        return (
-            jnp.array(self._log_h),
-            jnp.array(self._log_p),
-            jnp.array(self._log_e),
-            jnp.array(self._log_p_sorted),
-            jnp.array(self._log_dedp),
+        self._tables = (
+            np.log(h_arr),
+            np.log(p_arr),
+            np.log(e_arr),
+            np.log(p_arr[p_idx]),
+            np.log(dedp_arr[p_idx]),
         )
-
-    def _get_jax_structural_key(self):
-        """Return a hashable key identifying the JAX computational structure.
-
-        Two TOV instances with the same structural key produce identical XLA
-        computation graphs, allowing the JIT-compiled kernel to be shared even
-        when the underlying EOS differs.
-
-        The key includes the state-vector dimension, the perturbation layout,
-        and the EOS table size (JAX requires matching array shapes).
-        """
-        return (
-            self.nvar,
-            tuple(int(l) for l in self.leven),
-            tuple(int(l) for l in self.lodd),
-            len(self._log_h),
-        )
-
-    def _build_jax_rhs(self):
-        """Build a native JAX / XLA RHS using ``jnp`` operations throughout.
-
-        The returned callable ``jax_rhs(h, y, eos_tables) -> jnp.ndarray``
-        mirrors :meth:`__tov_rhs` but replaces all NumPy operations with their
-        JAX equivalents so that diffrax can JIT-compile the entire integration
-        loop in a single XLA kernel.
-
-        EOS tables are passed as an argument (not closed over) so that TOV
-        instances with different EOS but the same structural layout share one
-        compiled kernel.
-
-        * EOS interpolation uses ``jnp.interp`` on the caller-supplied tables.
-        * Perturbation loops are *statically unrolled* at Python level
-          (compile-time constants) — JAX sees no Python control flow.
-        * Array updates use ``dy.at[i].set(v)`` (JAX immutable semantics).
-
-        Returns ``None`` if JAX is not installed.
-        """
-        try:
-            import jax
-            import jax.numpy as jnp
-        except ImportError:
-            return None
-
-        jax.config.update("jax_enable_x64", True)
-
-        i_r, i_m, i_nu = self._i_r, self._i_m, self._i_nu
-        nvar = self.nvar
-        even_idx = list(self._even_idx)
-        leven_l = list(self.leven)
-        odd_idx = list(self._odd_idx)
-        lodd_l = list(self.lodd)
-        pi = float(np.pi)
-
-        def jax_rhs(h, y, eos_tables):
-            log_h, log_p, log_e, log_p_sorted, log_dedp = eos_tables
-
-            # EOS evaluation via log-space interpolation
-            lh = jnp.log(h)
-            p = jnp.exp(jnp.interp(lh, log_h, log_p))
-            e = jnp.exp(jnp.interp(lh, log_h, log_e))
-            dedp = jnp.exp(jnp.interp(jnp.log(p), log_p_sorted, log_dedp))
-
-            r = y[i_r]
-            m = y[i_m]
-            dr_dh = -r * (r - 2.0 * m) / (m + 4.0 * pi * r**3 * p)
-            dm_dh = 4.0 * pi * r**2 * e * dr_dh
-            dnu_dr = 2.0 * (m + 4.0 * pi * r**3 * p) / (r * (r - 2.0 * m))
-            dy = jnp.zeros(nvar, dtype=jnp.float64)
-            dy = dy.at[i_r].set(dr_dh)
-            dy = dy.at[i_m].set(dm_dh)
-            dy = dy.at[i_nu].set(dnu_dr * dr_dh)
-
-            # Even perturbations (Python loop unrolled at JAX trace time)
-            for l_val, (iH, idH) in zip(leven_l, even_idx):
-                Lam = float(l_val * (l_val + 1))
-                div_r = 1.0 / r
-                div_r2 = div_r**2
-                exp_lam = 1.0 / (1.0 - 2.0 * m * div_r)
-                C1_e = 2.0 / r + exp_lam * (2.0 * m * div_r2 + 4.0 * pi * r * (p - e))
-                C0_e = -(dnu_dr**2) + exp_lam * (
-                    -Lam * div_r2 + 4.0 * pi * (5.0 * e + 9.0 * p + (e + p) * dedp)
-                )
-                H = y[iH]
-                dH = y[idH]
-                dy = dy.at[iH].set(dH * dr_dh)
-                dy = dy.at[idH].set(-(C0_e * H + C1_e * dH) * dr_dh)
-
-            # Odd perturbations (Python loop unrolled at JAX trace time)
-            for l_val, (iPsi, idPsi) in zip(lodd_l, odd_idx):
-                Lam = float(l_val * (l_val + 1))
-                div_r = 1.0 / r
-                div_r2 = div_r**2
-                div_r3 = div_r * div_r2
-                r3 = r * r * r
-                exp_lam = 1.0 / (1.0 - 2.0 * m * div_r)
-                C1_o = exp_lam * (2.0 * m + 4.0 * pi * r3 * (p - e)) * div_r2
-                C0_o = exp_lam * (-Lam * div_r2 + 6.0 * m * div_r3 - 4.0 * pi * (e - p))
-                Psi = y[iPsi]
-                dPsi = y[idPsi]
-                dy = dy.at[iPsi].set(dPsi * dr_dh)
-                dy = dy.at[idPsi].set(-(C0_o * Psi + C1_o * dPsi) * dr_dh)
-
-            return dy
-
-        return jax_rhs
-
-    def __pert_even(self, ell, m, r, p, e, dedp, dnu_dr=[]):
-        """
-        Eq.(27-29) of Damour & Nagar, Phys. Rev. D 80, 084035 (2009)
-        https://arxiv.org/abs/0906.0096
-        Note only C0 depends on ell: return an array of values
-        """
-        r2 = r**2
-        r3 = r * r2
-        div_r = 1.0 / r
-        div_r2 = div_r**2
-        exp_lam = 1.0 / (1.0 - 2.0 * m * div_r)
-        if not dnu_dr:
-            dnu2 = (2.0 * (m + 4.0 * np.pi * r3 * p) / (r * (r - 2.0 * m))) ** 2
-        else:
-            dnu2 = dnu_dr**2
-        C1 = 2.0 / r + exp_lam * (2 * m * div_r2 + 4 * np.pi * r * (p - e))
-        C0 = np.zeros(max(ell) + 1)
-        for l in ell:
-            Lam = l * (l + 1)
-            C0[l] = -dnu2
-            C0[l] += exp_lam * (
-                -Lam * div_r2 + 4 * np.pi * (5 * e + 9 * p + (e + p) * dedp)
-            )
-        return C1, C0
-
-    def __pert_odd(self, ell, m, r, p, e, dedp):
-        """
-        Eq.(31) of Damour & Nagar, Phys. Rev. D 80, 084035 (2009)
-        https://arxiv.org/abs/0906.0096
-        Note only C0 depends on ell: return an array of values
-        """
-        r2 = r**2
-        r3 = r * r2
-        div_r = 1.0 / r
-        div_r2 = div_r**2
-        div_r3 = div_r * div_r2
-        exp_lam = 1.0 / (1.0 - 2.0 * m * div_r)
-        C1 = exp_lam * (2 * m + 4 * np.pi * r3 * (p - e)) * div_r2
-        C0 = np.zeros(max(ell) + 1)
-        for l in ell:
-            Lam = l * (l + 1)
-            C0[l] = exp_lam * (-Lam * div_r2 + 6 * m * div_r3 - 4 * np.pi * (e - p))
-        return C1, C0
-
-    def _apply_even_perts(self, dy, y, m, r, p, e, dedp, dr_dh, dnu_dr):
-        """Apply even-parity perturbation equations to derivative vector *dy*."""
-        C1, C0 = self.__pert_even(self.leven, m, r, p, e, dedp, dnu_dr)
-        for l, (iH, idH) in zip(self.leven, self._even_idx):
-            H = y[iH]
-            dH = y[idH]
-            dy[iH] = dH * dr_dh
-            dy[idH] = -(C0[l] * H + C1 * dH) * dr_dh
-
-    def _apply_odd_perts(self, dy, y, m, r, p, e, dedp, dr_dh):
-        """Apply odd-parity perturbation equations to derivative vector *dy*."""
-        C1, C0 = self.__pert_odd(self.lodd, m, r, p, e, dedp)
-        for l, (iPsi, idPsi) in zip(self.lodd, self._odd_idx):
-            Psi = y[iPsi]
-            dPsi = y[idPsi]
-            dy[iPsi] = dPsi * dr_dh
-            dy[idPsi] = -(C0[l] * Psi + C1 * dPsi) * dr_dh
-
-    def __tov_rhs(self, h, y):
-        """ODE r.h.s. for TOV equations with pseudo-enthalpy independent variable.
-
-        Implements Eqs. (5) and (6) of Lindblom, Astrophys. J. 398, 569 (1992),
-        and Eqs. (18), (27), (28) of Damour & Nagar, Phys. Rev. D 80, 084035 (2009).
-        """
-        dy = np.zeros_like(y)
-        r = y[self._i_r]
-        m = y[self._i_m]
-        p, e, dedp = self._eos_eval(h)
-        dr_dh = -r * (r - 2.0 * m) / (m + 4.0 * np.pi * r**3 * p)
-        dm_dh = 4.0 * np.pi * r**2 * e * dr_dh
-        dnu_dr = 2.0 * (m + 4.0 * np.pi * r**3 * p) / (r * (r - 2.0 * m))
-        dy[self._i_r] = dr_dh
-        dy[self._i_m] = dm_dh
-        dy[self._i_nu] = dnu_dr * dr_dh
-        self._update_even(dy, y, m, r, p, e, dedp, dr_dh, dnu_dr)
-        self._update_odd(dy, y, m, r, p, e, dedp, dr_dh)
-        return dy
 
     def __initial_data(self, pc, dh_fact=-1e-12):
         """Set initial data for the TOV ODE using the pseudo-enthalpy formalism.
@@ -544,10 +312,6 @@ class TOV(object):
         dedp_c = self.eos.EnergyDensityDeriv_Of_Pressure(pc)
         dhdp_c = 1.0 / (ec + pc)
         dedh_c = dedp_c / dhdp_c
-        # Honour dh_fact. This read `dh = -1e-12 * hc`, hardcoding the default
-        # and silently ignoring the argument, so `TOV(dhfact=...)` had no
-        # effect on where the integration started or stopped -- and any test
-        # varying it was really comparing a value against itself.
         dh = dh_fact * hc
         h0 = hc + dh
         h1 = 0.0 - dh
@@ -572,184 +336,38 @@ class TOV(object):
     def solve(self, pc):
         """Solve the TOV equations for a given central pressure *pc*.
 
-        Lindblom (1992), Astrophys. J. 398, 569.
+        Lindblom (1992), Astrophys. J. 398, 569. Keeps the trajectory, which ends
+        at the surface, in ``self.sol``. Returns nan values if the integration
+        stops short of the surface.
         """
-        y, h0, h1 = self.__initial_data(pc, dh_fact=self.dhfact)
-        sol = self.solver.solve(
-            self.__tov_rhs,
-            [h0, h1],
-            y,
-            first_step=abs(self.dhfact),
-            rtol=self.ode_rtol,
-            atol=self.ode_atol,
+        y0, h0, h1 = self.__initial_data(pc, dh_fact=self.dhfact)
+        h_end, y_end, success, traj = self.solver.integrate(
+            self.equations,
+            self._tables,
+            h0,
+            h1,
+            y0,
+            abs(self.dhfact),
+            self.ode_rtol,
+            self.ode_atol,
+            trajectory=True,
         )
-
-        # Final Euler step to the surface
-        y = sol.y[:, -1]
-        dy = self.__tov_rhs(sol.t[-1], y)
-        y[:] -= dy[:] * h1
-        np.append(sol.y, y)
-        M, R, C = self.__compute_mass_radius(y)
-        # Match to Schwarzschild exterior
-        sol.y[self._i_nu, :] += np.log(1.0 - (2.0 * M) / R) - sol.y[self._i_nu, -1]
-
-        self.sol = sol
-        if len(self.leven):
-            k, h = {}, {}
-            for l, (iH, idH) in zip(self.leven, self._even_idx):
-                yyl = R * y[idH] / y[iH]
-                k[l] = self.__compute_Love_even(l, C, yyl)
-                h[l] = self.__compute_shape(l, C, yyl)
-        if len(self.lodd):
-            j = {}
-            for l, (iPsi, idPsi) in zip(self.lodd, self._odd_idx):
-                yyl = R * y[idPsi] / y[iPsi]
-                j[l] = self.__compute_Love_odd(l, C, yyl)
-
-        if len(self.leven) and len(self.lodd):
-            return M, R, C, k, h, j
-        elif len(self.leven) and not len(self.lodd):
-            return M, R, C, k, h
-        elif not len(self.leven) and len(self.lodd):
-            return M, R, C, j
-        else:
-            return M, R, C
-
-    # ------------------------------------------------------------------
-    # SPEED: run solve() for many central pressures in parallel
-    # ------------------------------------------------------------------
-    def solve_parallel(self, pc_array, n_jobs=-1):
-        """
-        Solve TOV for an array of central pressures in parallel.
-
-        Requires joblib (pip install joblib). Falls back to serial if unavailable.
-
-        Parameters
-        ----------
-        pc_array : array-like of central pressures
-        n_jobs   : number of parallel workers; -1 = all CPUs
-
-        Returns
-        -------
-        list of solve() return values, one per entry in pc_array.
-
-        Example
-        -------
-        results = tov.solve_parallel(pc_array)
-        M_arr = np.array([r[0] for r in results])
-        R_arr = np.array([r[1] for r in results])
-        """
-        if not _JOBLIB_AVAILABLE:
-            return [self.solve(pc) for pc in pc_array]
-        return Parallel(n_jobs=n_jobs)(_delayed(self.solve)(pc) for pc in pc_array)
-
-    # ------------------------------------------------------------------
-    # SPEED: one batched XLA call for many central pressures
-    # ------------------------------------------------------------------
-    def _solve_batched_jax(self, pc_array):
-        """Integrate every central pressure in *pc_array* in a single
-        ``jax.vmap``-ed XLA call.
-
-        Returns ``(y_final, h1)`` -- the state vector at the end of each
-        integration, shape ``(len(pc_array), nvar)``, and the matching
-        end-of-integration pseudo-enthalpies -- or ``None`` if the batched
-        path is unavailable (backend is not ``'jax'``, jax/diffrax missing,
-        or this TOV has no native JAX RHS), in which case the caller should
-        fall back to looping over :meth:`solve`.
-
-        Only the ODE integration is batched. The per-star algebra that
-        follows it (Euler step to the surface, Love numbers) is cheap and
-        stays in a Python loop in :meth:`solve_many`, so the higher-multipole
-        formulas need no vectorisation.
-        """
-        if not isinstance(self.solver, JaxSolver):
-            return None
-        try:
-            import jax
-            import jax.numpy as jnp
-            import diffrax as dx
-        except ImportError:
-            return None
-
-        jax_rhs = self._get_jax_rhs()
-        eos_tables = self._get_jax_eos_tables()
-        struct_key = self._get_jax_structural_key()
-        if jax_rhs is None or eos_tables is None or struct_key is None:
-            return None
-
-        if not JaxSolver._x64_set:
-            jax.config.update("jax_enable_x64", True)
-            JaxSolver._x64_set = True
-
-        initial = [self.__initial_data(pc, dh_fact=self.dhfact) for pc in pc_array]
-        y0 = jnp.array(np.stack([np.asarray(i[0], dtype=float) for i in initial]))
-        h0 = jnp.array(np.array([float(i[1]) for i in initial]))
-        h1 = np.array([float(i[2]) for i in initial])
-
-        rtol, atol = self.ode_rtol, self.ode_atol
-        max_steps = self.solver.max_steps
-        # Same cache discipline as JaxSolver.solve: key on the computation's
-        # structure so one compiled kernel is reused across EOSs *and* across
-        # calls, and add the batch size, which XLA bakes in as a shape.
-        jit_key = ("_vmap", struct_key, self.nvar, rtol, atol, max_steps, len(pc_array))
-        cache = JaxSolver._jit_solve_cache
-        if jit_key not in cache:
-            _jrhs = jax_rhs
-            _dt0 = -abs(self.dhfact)
-
-            def _one(t0_, t1_, y0_, tables_):
-                sol = dx.diffeqsolve(
-                    dx.ODETerm(lambda t, y, args: _jrhs(t, y, args)),
-                    dx.Dopri5(),
-                    t0=t0_,
-                    t1=t1_,
-                    dt0=_dt0,
-                    y0=y0_,
-                    args=tables_,
-                    stepsize_controller=dx.PIDController(rtol=rtol, atol=atol),
-                    saveat=dx.SaveAt(t1=True),
-                    max_steps=max_steps,
-                    # A single bad central pressure in the batch must not take
-                    # the whole call down; it comes back as NaN instead and is
-                    # filtered by the caller, matching the per-sample tolerance
-                    # of the serial path.
-                    throw=False,
-                )
-                return sol.ys[-1]
-
-            cache[jit_key] = jax.jit(jax.vmap(_one, in_axes=(0, 0, 0, None)))
-
-        y_final = np.asarray(
-            cache[jit_key](h0, jnp.array(h1), y0, eos_tables), dtype=float
-        )
-        return y_final, h1
-
-    def _nan_result(self):
-        """A :meth:`solve`-shaped return value with every entry ``nan``, used
-        to report a single failed central pressure without aborting a batch."""
-        nan = float("nan")
-        k = {int(l): nan for l in self.leven}
-        h = {int(l): nan for l in self.leven}
-        j = {int(l): nan for l in self.lodd}
-        if len(self.leven) and len(self.lodd):
-            return (nan, nan, nan, k, h, j)
-        elif len(self.leven):
-            return (nan, nan, nan, k, h)
-        elif len(self.lodd):
-            return (nan, nan, nan, j)
-        return (nan, nan, nan)
+        y_surf, result = self._star(h_end, y_end, success)
+        if y_surf is not None:
+            M, R = y_surf[self._i_m], y_surf[self._i_r]
+            ys = np.column_stack([traj.y, y_surf])
+            # Match to the Schwarzschild exterior
+            ys[self._i_nu, :] += np.log(1.0 - 2.0 * M / R) - ys[self._i_nu, -1]
+            traj = SolverResult(np.append(traj.t, 0.0), ys)
+        self.sol = traj
+        return result
 
     def solve_many(self, pc_array):
         """Solve the TOV equations for an array of central pressures.
 
-        Same return values as :meth:`solve`, as a list with one entry per
-        central pressure. On the ``'jax'`` backend every integration runs in
-        a single batched XLA kernel, which is roughly 10x faster than looping
-        over :meth:`solve` for a typical 30-point mass-radius sequence; on
-        every other backend this *is* that loop, so results are unchanged.
-
-        Unlike :meth:`solve` this does not populate ``self.sol``: only the
-        final state of each integration is retained, not the full trajectory.
+        Returns one :meth:`solve` result per central pressure, nan where the
+        integration stops short of the surface. On ``'jax'`` all central
+        pressures run in one compiled kernel. Leaves ``self.sol`` unchanged.
 
         Parameters
         ----------
@@ -758,55 +376,62 @@ class TOV(object):
         Returns
         -------
         list of :meth:`solve` return values, one per entry in *pc_array*.
-        Entries whose integration failed contain ``nan``.
         """
         pc_array = np.atleast_1d(np.asarray(pc_array, dtype=float))
+        initial = [self.__initial_data(pc, dh_fact=self.dhfact) for pc in pc_array]
+        h_end, y_end, success = self.solver.integrate_many(
+            self.equations,
+            self._tables,
+            np.array([i[1] for i in initial]),
+            np.array([i[2] for i in initial]),
+            np.stack([i[0] for i in initial]),
+            abs(self.dhfact),
+            self.ode_rtol,
+            self.ode_atol,
+        )
+        return [self._star(*args)[1] for args in zip(h_end, y_end, success)]
 
-        batched = self._solve_batched_jax(pc_array)
-        if batched is None:
-            # Serial fallback. One unsolvable central pressure must not abort
-            # the rest of the sequence, so that a caller sweeping a range gets
-            # the same per-point tolerance the batched path gives it for free
-            # (diffrax returns nan there rather than raising).
-            results = []
-            for pc in pc_array:
-                try:
-                    results.append(self.solve(pc))
-                except Exception:
-                    results.append(self._nan_result())
-            return results
-        y_final, h1_all = batched
+    def _star(self, h_end, y, success):
+        """Euler step from the end of the integration to the surface, h = 0,
+        then M, R, C and the Love numbers.
 
-        results = []
-        for y, h1 in zip(y_final, h1_all):
-            y = np.array(y, dtype=float, copy=True)
-            # Final Euler step to the surface, as in solve(). The integration
-            # ends at h1, so that is the point at which the RHS is evaluated.
-            dy = self.__tov_rhs(h1, y)
-            y -= dy * h1
-            M, R, C = self.__compute_mass_radius(y)
+        Returns
+        -------
+        tuple
+            (state at the surface, :meth:`solve` return value), or
+            (None, nan values) if the integration stopped short.
+        """
+        if not (success and np.all(np.isfinite(y))):
+            return None, self._pack(*(np.nan,) * 3)
+        y = y - self.equations(h_end, y, self._tables, np) * h_end
+        M, R, C = self.__compute_mass_radius(y)
+        k = {
+            l: self.__compute_Love_even(l, C, R * y[idH] / y[iH])
+            for l, (iH, idH) in zip(self.leven, self._even_idx)
+        }
+        h = {
+            l: self.__compute_shape(l, C, R * y[idH] / y[iH])
+            for l, (iH, idH) in zip(self.leven, self._even_idx)
+        }
+        j = {
+            l: self.__compute_Love_odd(l, C, R * y[idPsi] / y[iPsi])
+            for l, (iPsi, idPsi) in zip(self.lodd, self._odd_idx)
+        }
+        return y, self._pack(M, R, C, k, h, j)
 
-            if len(self.leven):
-                k, h = {}, {}
-                for l, (iH, idH) in zip(self.leven, self._even_idx):
-                    yyl = R * y[idH] / y[iH]
-                    k[l] = self.__compute_Love_even(l, C, yyl)
-                    h[l] = self.__compute_shape(l, C, yyl)
-            if len(self.lodd):
-                j = {}
-                for l, (iPsi, idPsi) in zip(self.lodd, self._odd_idx):
-                    yyl = R * y[idPsi] / y[iPsi]
-                    j[l] = self.__compute_Love_odd(l, C, yyl)
-
-            if len(self.leven) and len(self.lodd):
-                results.append((M, R, C, k, h, j))
-            elif len(self.leven):
-                results.append((M, R, C, k, h))
-            elif len(self.lodd):
-                results.append((M, R, C, j))
-            else:
-                results.append((M, R, C))
-        return results
+    def _pack(self, M, R, C, k=None, h=None, j=None):
+        """The :meth:`solve` return value. (M, R, C), followed by (k, h) if there
+        are even multipoles and j if there are odd ones. Love numbers not given
+        are nan."""
+        nan = float("nan")
+        out = (M, R, C)
+        if len(self.leven):
+            k = k or {int(l): nan for l in self.leven}
+            h = h or {int(l): nan for l in self.leven}
+            out += (k, h)
+        if len(self.lodd):
+            out += (j or {int(l): nan for l in self.lodd},)
+        return out
 
     def __compute_legendre(self, c, l):
         """
@@ -1005,6 +630,8 @@ class TOV(object):
         k = 0.0
         if ell < 2:
             return k
+        if ell == 2 and c < 0.03:
+            return _k2_small_compactness(c, y)
         if ell == 2:
             nk = (1 - 2 * c) ** 2 * (2 + 2 * c * (y - 1) - y)
             dk = (
